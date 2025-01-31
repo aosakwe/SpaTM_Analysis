@@ -1,0 +1,261 @@
+---
+title: "SpaTM_Figure4CD"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+```{r,echo =FALSE,message=FALSE,warning=FALSE}
+set.seed(1234) 
+library(SpaTM)
+library(scran)
+library(scater) 
+library(tidyverse)   
+library(Matrix) 
+library(spatialLIBD)
+library(torch)
+library(DescTools)
+library(mclust)
+spe <- readRDS("../../scGTM/Input/spe.rds")
+
+
+spe <- spe[,spe$spatialLIBD != 'Unknown']
+spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
+
+
+scenarios <- list()
+for (cur_sample in unique(spe$sample_id)){
+  scenarios[[cur_sample]] <- list(train = c(cur_sample),
+                       test = c(cur_sample))
+}
+```
+
+```{r,messages = FALSE,warning=FALSE,echo = FALSE}
+##Remove Mitochondrial genes
+library(EnsDb.Hsapiens.v75)
+gns <- genes(EnsDb.Hsapiens.v75, filter = ~ seq_name == "MT")
+spe <- spe[!rownames(spe) %in% gns$gene_id,]
+## Remove Ribosomal Proteins
+cur_genes <- genes(EnsDb.Hsapiens.v75)$symbol
+cur_genes <- cur_genes[grepl(pattern = "^RP[SL][[:digit:]]|^RP[[:digit:]]|^RPSA",cur_genes)]
+genes_remove <- genes(EnsDb.Hsapiens.v75, filter = ~ symbol %in% cur_genes)$gene_id
+spe <- spe[!rownames(spe) %in% genes_remove,]
+
+K <- 8
+spe <- SpatialTopicExperiment(spe,K = K)
+
+```
+
+```{r}
+max_iter <- 200
+lr <- 0.00001
+K <- 8
+n_genes <- 3000
+scenario <- 1
+all_models <- list()
+all_plots <- list()
+all_results <- list()
+all_spe <- list()
+nbr_dist <- 3
+results <- matrix(0,nrow = length(scenarios),ncol = 2)
+colnames(results) <- c('SpaTM-R (K-means)','SpaTM-R (Leiden)')
+#,'SpaTM-R (PAM)','SpaTM-R (Leiden)','SpaTM-R (Louvain)')
+
+rownames(results) <- names(scenarios)
+for(i in 1:length(scenarios)){
+
+  
+  print(paste("Scenario: ",i,sep = ''))
+  print(scenarios[[i]]$train)
+  cur_sample <- scenarios[[i]]$train
+  print(paste("Topics|LR|N_Genes|Dist - ",K,"|",lr,"|",n_genes,"|",nbr_dist,sep = ''))
+  spe_train <- spe[,spe$sample_id %in% scenarios[[i]]$train]
+  spe_train$spatialLIBD <- as.factor(as.character(spe_train$spatialLIBD))
+
+  ##Get Top genes
+  spe_train <- computeGeometricFactors(spe_train)
+  spe_train <- logNormCounts(spe_train)
+  dec <- modelGeneVar(spe_train)
+  top_hvgs <- getTopHVGs(dec,n = n_genes)
+  spe_train <- spe_train[top_hvgs,]
+
+  #Remove cells & genes with no counts
+  spe_train <- spe_train[,colSums(counts(spe_train)) > 0]
+  spe_train <- spe_train[rowSums(counts(spe_train)) >0,]
+  top_hvgs <- rownames(spe_train)
+
+  spe_train <- SpatialTopicExperiment(
+    spe_train,
+    guided = FALSE,
+    labels = NULL,
+    K,
+    hvg = NULL)
+
+
+  ##Define Neighbors
+  #nbr_dist <- dist_params[i]
+  nbr_list <- get_spots(spe_train,'sample_id','int_cell',NULL,dist = nbr_dist,loss_fun = 1)
+
+
+  #Train
+  D <- ncol(spe_train)
+
+
+
+
+  ####Run RTM######
+  rtm_weights <- train_RTM(counts(spe_train),
+            spe_train$int_cell,
+            rowData(spe_train)$gene_ints,
+            nbr_list,
+            alphaPrior(spe_train),
+            betaPrior(spe_train),
+            K,
+            ncol(spe_train),
+            ndk(spe_train),
+            nwk(spe_train),
+            6,
+            max_iter,
+            verbal = TRUE,
+            zero_gamma = FALSE,
+            rand_gamma = TRUE,#FALSE,
+            thresh = 0.00001,
+            lr =lr,
+            rho = 50000,
+            loss_fun = 1,
+            m_update = TRUE)
+
+
+  spe_train <- buildTheta(spe_train)
+  spe_train <- buildPhi(spe_train)
+
+  all_models[[cur_sample]] <- list(spe_train = spe_train,
+                          rtm_weights = rtm_weights,
+                          top_hvgs = top_hvgs,
+                          K = K,
+                          lr = lr,
+                          nbr_list = nbr_list)
+
+  ############Predict Test###################
+  for(j in 1:(length(scenarios[[i]]$test))){
+    ##Start
+    spe_test <- spe[,spe$sample_id %in% scenarios[[i]]$test[j]]
+    spe_test$spatialLIBD <- as.factor(as.character(spe_test$spatialLIBD))
+    ####Top HVGs ####
+    spe_test <- spe_test[top_hvgs,]
+    ######
+    
+    spe_test <- SpatialTopicExperiment(
+      spe_test,
+      guided = FALSE,
+      labels = NULL,
+      K,
+      hvg = NULL)
+    
+    spe_test <- scGTMPredict(spe_test,1,100,FALSE,phi(spe_train))
+    spe_test <- buildTheta(spe_test)
+    
+    
+    
+    ##Build Adjacency Matrices 
+    reducedDim(spe_test,'ADJ') <- get_all_pred(spe_test,
+                             rtm_weights,loss_fun = 1)
+    num_clusts <- length(unique(spe_test$spatialLIBD))
+    spe_test <- runPCA(spe_test,dimred = 'ADJ')
+    
+    ### Generate Clusters
+    clust_input <- 'PCA'
+    library(bluster)
+    library(cluster)
+    adj_clust <- kmeans(reducedDim(spe_test,'ADJ'),7,nstart = 25,iter.max = 25)
+    #pam_clust <- pam(reducedDim(spe_test,'ADJ'),7)
+    lei_clust <-  clust_optim(spe_test,num_clusts,100,X = clust_input, k = 10,alg = 'leiden')
+    #lou_clust <-  clust_optim(spe_test,num_clusts,100,X = clust_input, k = 10,alg = 'louvain')
+   
+    
+    spe_test$clust <- adj_clust$cluster
+    #spe_test$pam_clust <- pam_clust$clustering
+    spe_test$leiden <- lei_clust$clustering
+    #spe_test$louvain <- lou_clust$clustering
+    
+     
+     
+     
+    all_pred <- data.frame(Kmeans = spe_test$clust,
+                           #PAM = spe_test$pam_clust,
+                           Leiden = spe_test$leiden)#,
+                           #Louvain = spe_test$louvain)
+    perf_df <- get_perf(spe_test,
+                        all_pred,
+                        spe_test$spatialLIBD,
+                        nbr_list,
+                        smooth = TRUE, k = NULL)
+    
+    spe_test$clust <- adj_clust$cluster %>% as.character()
+    #spe_test$pam_clust <- pam_clust$clustering %>% as.character()
+    spe_test$leiden <- lei_clust$clustering %>% as.character()
+    #spe_test$louvain <- lou_clust$clustering %>% as.character()
+    spe_test$smooth <- rtm_smooth(spe_test,spe_test$leiden,nbr_list = nbr_list) 
+     
+    all_results[[cur_sample]] <- perf_df
+    all_plots[[cur_sample]] <- plot_perf(spe_test,all_pred,perf_df,nbr_list,smooth = TRUE, k= NULL)
+    all_spe[[cur_sample]] <- list(spe = spe_test,
+                                  nbrs = nbr_list,
+                                  all_pred = all_pred,
+                                  perf_df = perf_df)
+    ##Store in Results
+    if (length(scenarios[[i]]$test) > 1){
+      results[j,] <- perf_df$ARI
+      print(results[j,])
+    } else {
+      results[i,] <- perf_df$ARI
+      print(results[i,])
+    }
+    
+    print('=============')
+  }
+  #####################################
+}
+
+#Acquire LIBD Benchmark results
+cur_bench <- read.csv("../Benchmarks/libd_pred.csv")
+results <- cbind(cur_bench,results)
+
+```
+
+## Panel D
+
+```{r}
+library(reshape2)
+res_df <- melt(results[,3:ncol(results)])
+
+ggplot(res_df,aes(x = variable,y = value, fill = variable)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 1, size = 1) + 
+  theme_minimal(base_size = 20) +
+  labs(y = 'ARI',x = 'Method',title = 'Full Spatial Clustering Benchmark') +
+  theme(axis.line = element_line(color = 'black'),
+        axis.text.x = element_text(size = 14),
+        axis.ticks = element_line(),
+        legend.position = 'none',
+        plot.title = element_text(hjust = 0.5))
+
+
+res_df$variable <- str_replace(res_df$variable,'SpaTM-R \\(Leiden\\)',"SpaTM-R")
+res_df$variable <- factor(res_df$variable,levels = unique(res_df$variable)[c(5,1,3,2,4)])
+res_df %>%
+  dplyr::filter(!variable %in% c('SpaTM-R (K-means)','SpaTM-R (PAM)','SpaTM-R (Louvain)')) %>%
+ggplot(aes(x = variable,y = value, fill = variable)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 1, size = 1) + 
+  theme_minimal(base_size = 20) +
+  labs(y = 'ARI',x = 'Method',title = 'Spatial Clustering Benchmark') +
+  theme(axis.line = element_line(color = 'black'),
+        axis.text.x = element_text(size = 14),
+        axis.ticks = element_line(),
+        legend.position = 'none',
+        plot.title = element_text(hjust = 0.5))
+
+print(apply(results[,3:(ncol(results))],2,mean))
+print(apply(results[,3:(ncol(results))],2,median))
+```

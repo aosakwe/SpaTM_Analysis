@@ -1,0 +1,512 @@
+---
+title: "SpaTM Figure 4AB"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+## 
+
+```{r,echo =FALSE,message=FALSE,warning=FALSE}
+set.seed(1234) 
+library(SpaTM)
+library(scran)
+library(scater) 
+library(tidyverse)   
+library(Matrix) 
+library(spatialLIBD)
+library(torch)
+library(DescTools)
+spe <- readRDS("../data/spe.rds")
+samples <- c("151673","151674","151675","151676","151507")
+spe <- spe[,spe$sample_id %in% samples]
+spe <- spe[,spe$spatialLIBD != 'Unknown']
+spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
+
+scenarios <- list(list(train = c("151673"),test = c('151676','151507')),
+                  list(train = c("151673","151674","151675"),
+                       test = c('151676','151507')))
+
+```
+
+```{r,messages = FALSE,warning=FALSE}
+
+############### Hyper-params
+K <- 8
+max_iter <- 200
+mlp_layers <- 1
+d_hidden <- 64
+lr <- 1e-5
+############ ###
+
+##Remove Mitochondrial genes
+library(EnsDb.Hsapiens.v75)
+gns <- genes(EnsDb.Hsapiens.v75, filter = ~ seq_name == "MT")
+spe <- spe[!rownames(spe) %in% gns$gene_id,]
+## Remove Ribosomal Proteins
+cur_genes <- genes(EnsDb.Hsapiens.v75)$symbol
+cur_genes <- cur_genes[grepl(pattern = "^RP[SL][[:digit:]]|^RP[[:digit:]]|^RPSA",cur_genes)]
+genes_remove <- genes(EnsDb.Hsapiens.v75, filter = ~ symbol %in% cur_genes)$gene_id
+spe <- spe[!rownames(spe) %in% genes_remove,]
+
+
+results <- matrix(0,nrow = 4,ncol = 2)
+rownames(results) <- paste('Scenario ',1:nrow(results),sep = '')
+
+spe <- SpatialTopicExperiment(spe,K = K)
+```
+
+```{r,warning=FALSE}
+## Create  2-Model baseline inputs
+
+create_inputs <- function(spe,nbr_list){
+  x <- matrix(0,nrow = 0,ncol = ncol(theta(spe)))
+  colnames(x) <- colnames(theta(spe))
+  y <- c()
+  for (i in spe$int_cell){
+    cur_nbr <- nbr_list[[i]]
+    if (nrow(cur_nbr) == 0){
+      next
+    }
+    cur_cell <- theta(spe)[i,]
+    y <- c(y,cur_nbr[,2])
+    cur_nbr <- theta(spe)[cur_nbr[,1]+1,]
+    
+    cur_nbr <- apply(cur_nbr,1,function(a){
+      a * cur_cell
+    })
+    #print(nbr_list[[i]])
+
+    x <- rbind(x,t(cur_nbr))
+    if (length(y) != nrow(x)){
+      print(dim(cur_nbr))
+      print(dim(nbr_list[[i]]))
+      print(i)
+      stop("Error")
+    }
+  }
+  return(list(x,y))
+}
+## Fit MLP (0 to 3 hidden layers)
+baseline_mlp <- function(x,y,layers,d_in,d_hidden,max_epoch,lr){
+  mlp <- rtm_build_mlp(layers,d_in,d_hidden)
+  x <- torch::torch_tensor(x)
+  y <- torch_tensor(y,dtype = torch_float(),requires_grad = T)
+   train_dl <- mlp_data(x,y) %>%
+      dataloader(10000,TRUE,num_workers = 0)
+  mlp <- fit_rtm_mlp(mlp,train_dl,lr,max_epoch)
+  return(mlp)
+}
+
+###predict full adjacency matrix
+get_all_pred <- function(spe,spe_baseline,rtm_weights,nbr_list,bench_models,model_size){
+  all_mat <- list()
+
+
+  all_mat[[1]] <- nbr_pred(theta(spe),rtm_weights,1,loss_fun = 1)
+  ## Create full input
+  for (i in 1:length(bench_models)){
+    ## Pred
+    mlp_parameters <-  lapply(bench_models[[i]]$parameters,
+                             function(a){t(as.matrix(a))})
+    all_mat[[length(all_mat)+1]] <- mlp_nbr_pred(theta(spe_baseline),
+                      model_size[i],
+                      mlp_parameters)
+  }
+  return(all_mat)
+}
+
+
+## Build ROC Curve
+
+build_ROC <- function(all_pred,grd_adj,nbr_list,full_adj = FALSE,
+                      titles){
+  roc_list <- list()
+for (i in 1:length(all_pred)){
+  pred_adj <- all_pred[[i]]
+  model_name <- titles[i]
+  perf_df <- matrix(0,nrow = 0,ncol = 5)
+  for (thresh in seq(0,1,length.out = 250)){
+    tn <- 0
+    tp <- 0
+    fn <- 0
+    fp <- 0
+    if (full_adj){
+      pred_adj[pred_adj > thresh] <- 1
+      pred_adj[pred_adj <= thresh] <- 0
+    
+      tp <- length(which((pred_adj + grd_adj) == 2))
+      tn <- length(which((pred_adj + grd_adj) == 0))
+      fp <- length(which((pred_adj - grd_adj) == 1))
+      fn <- length(which((pred_adj - grd_adj) == -1))
+    }
+    else {
+      for (cell in 1:ncol(pred_adj)){
+        if (nrow(nbr_list[[cell]]) == 0){
+          next
+        }
+      grd_adj <- nbr_list[[cell]][,2]
+      nbr_ids <- nbr_list[[cell]][,1]+1
+      sub_adj <-  pred_adj[cell,nbr_ids]
+      sub_adj[sub_adj > thresh] <- 1
+      sub_adj[sub_adj <= thresh] <- 0
+  
+      tp <- tp + length(which((sub_adj + grd_adj) == 2))
+      tn <- tn + length(which((sub_adj + grd_adj) == 0))
+      fp <- fp + length(which((sub_adj - grd_adj) == 1))
+      fn <- fn + length(which((sub_adj - grd_adj) == -1))
+      
+      if (sum(c(tp,tn,fp,fn)) == 0){stop('Error with TP/TN/FP/FN Calculation!')}
+      }
+      
+  
+    }
+  
+   
+   
+    tpr <- tp/(tp+fn)
+    fpr <- fp/(fp+tn)
+    sens <- tp/(tp+fn) #recall
+    precis <- tp/(tp+fp)
+    perf_df <-rbind(perf_df,c(tpr,fpr,sens,precis,thresh))
+  }
+  roc_list[[model_name]] <- perf_df[,1:4]
+}
+
+return(roc_list)
+}
+
+
+plot_ROC <- function(roc_list,model_names,plot_title = ''){
+  
+plot(seq(0,1,length.out = 50),seq(0,1,length.out = 50),type = 'l',xlab = 'FPR',ylab = 'TPR')
+lines(roc_list[[1]][,2],roc_list[[1]][,1],col = 'red')
+lines(roc_list[[2]][,2],roc_list[[2]][,1],col = 'blue')
+lines(roc_list[[3]][,2],roc_list[[3]][,1],col = 'orange')
+legend(0.6, 0.5, legend=c("Random", model_names),
+       col=c("black", "red","blue","orange"), lty=1, cex=0.8)
+title(plot_title)
+}
+
+
+plot_AUC <- function(roc_list,model_names,plot_title = ''){
+  auc_val <- lapply(roc_list,function(a){
+    DescTools::AUC(a[,2],a[,1])
+  }) %>% unlist()
+  df <- data.frame(Model = model_names,AUC = auc_val)
+  p <- ggplot(df,aes(Model,AUC,fill = Model)) + 
+    geom_bar(stat = 'identity') +
+    labs(x = 'Model', y = 'AUROC', title = plot_title)
+  return(list(Plot = p,Results = df))
+}
+
+
+```
+
+```{r,warning=FALSE}
+K <- 8
+scenario <- 1
+all_models <- list()
+all_plots <- list()
+for(i in 1:length(scenarios)){
+  print(paste("Scenario: ",i,sep = ''))
+  spe_train <- spe[,spe$sample_id %in% scenarios[[i]]$train]
+
+  ##Get Top genes
+  spe_train <- computeGeometricFactors(spe_train)
+  spe_train <- logNormCounts(spe_train)
+  dec <- modelGeneVar(spe_train)
+  top_hvgs <- getTopHVGs(dec,n = 3000)
+  spe_train <- spe_train[top_hvgs,]
+   
+  #Remove cells & genes with no counts
+  spe_train <- spe_train[,colSums(counts(spe_train)) > 0]
+  spe_train <- spe_train[rowSums(counts(spe_train)) >0,]
+  top_hvgs <- rownames(spe_train)
+
+  spe_train <- SpatialTopicExperiment(
+    spe_train,
+    guided = FALSE,
+    labels = NULL,
+    K,
+    hvg = NULL)
+  nbr_list <- get_spots(spe_train,
+                        'sample_id','int_cell',
+                        NULL,dist = 3,loss_fun = 1)
+
+
+  #Train
+  D <- ncol(spe_train)
+
+  ## Build Inputs
+  train_copy <- spe_train
+  train_copy <- scGTM(train_copy,K,D,6,250,FALSE,FALSE,TRUE)
+  
+  train_copy <- buildPhi(train_copy)
+  train_copy <- scGTMPredict(train_copy,6,100,FALSE,phi(train_copy))
+  train_copy <- buildTheta(train_copy)
+  train_inputs <- create_inputs(train_copy,nbr_list)
+  names(train_inputs) <- c('x','y')
+  ## Logit
+  logit_model <- baseline_mlp(train_inputs$x,train_inputs$y,0,K,0,3000,lr)
+  ## 1-layer MLP TODO
+  mlp_model <- baseline_mlp(train_inputs$x,train_inputs$y,mlp_layers,K,d_hidden,3000,lr/100)
+  
+  model_size <- c(0,mlp_layers)
+  model_names <- c('SpaTM-R','LDA + LR', 'LDA + MLP')
+ 
+  
+  ####Run RTM######
+  rtm_weights <- train_RTM(counts(spe_train),
+                          spe_train$int_cell,
+                          rowData(spe_train)$gene_ints,
+                          nbr_list,
+                          alphaPrior(spe_train),
+                          betaPrior(spe_train),
+                          K,
+                          ncol(spe_train),
+                          ndk(spe_train),
+                          nwk(spe_train),
+                          6,
+                          max_iter,
+                          verbal = TRUE,
+                          zero_gamma = FALSE,
+                          rand_gamma = TRUE,
+                          thresh = 0.00001,
+                          lr =lr,
+                          rho = 50000,
+                          loss_fun = 1,
+                          m_update = TRUE)
+  
+  ################## Predictions 
+  spe_train <- buildTheta(spe_train)
+  spe_train <- buildPhi(spe_train)
+  
+  spe_train <- scGTMPredict(spe_train,1,150,FALSE,phi(spe_train))
+  spe_train <- buildTheta(spe_train)
+  
+  
+  #Store trained models
+  all_models[[i]] <- list(rtm_spe = spe_train,
+                          baseline_spe = train_copy,
+                          rtm_weights = rtm_weights,
+                          lr_model = logit_model,
+                          nn_model = mlp_model,
+                          model_size = model_size,
+                          nbr_list = nbr_list,
+                          hvgs = top_hvgs)
+  
+  
+  
+  ############Predict Test###################
+  for(j in 1:(length(scenarios[[i]]$test))){
+    ##Start
+    spe_test <- spe[,spe$sample_id %in% scenarios[[i]]$test[j]]
+    ####Top HVGs ####
+    spe_test <- spe_test[top_hvgs,]
+    ######
+    
+    spe_test <- SpatialTopicExperiment(
+      spe_test,
+      guided = FALSE,
+      labels = NULL,
+      K,
+      hvg = NULL)
+    spe_test2 <- spe_test
+    
+    nbr_list <- get_spots(spe_test,
+                          'sample_id','int_cell',
+                          NULL,dist = 3,
+                          loss_fun = 1)
+  
+    spe_test <- scGTMPredict(spe_test,1,150,FALSE,phi(spe_train))
+    spe_test <- buildTheta(spe_test)
+    
+    
+    spe_test2 <- scGTMPredict(spe_test2,1,150,FALSE,phi(train_copy))
+    spe_test2 <- buildTheta(spe_test2)
+    ##Build Adjacency Matrices TODO
+    adj_list <- get_all_pred(spe_test,
+                             spe_test2,
+                             rtm_weights,
+                             nbr_list,
+                             list(logit_model,mlp_model),
+                             model_size)
+  
+    grd_adj <- matrix(0,ncol(spe_test),ncol(spe_test))
+    for (z in 1:ncol(grd_adj)){
+      grd_adj[z,nbr_list[[z]][,1]+1] <- 1
+    }
+    ### Get Training ROC
+    #Build Adjacency Matrix
+    test_roc <- build_ROC(adj_list,grd_adj,nbr_list,full_adj = FALSE,
+                        titles = model_names)  
+    cur_res <- paste('Test Scenario -',scenario,sep = '')
+    all_plots[[cur_res]] <- plot_AUC(test_roc,
+                                     model_names,
+                                     cur_res)
+
+    
+    
+
+    
+    
+
+    scenario <- scenario + 1
+    print('=============')
+  }
+  #####################################
+}
+all_plots
+```
+
+## Panel B
+
+```{r}
+theta(spe_train) <- theta(spe_train)[spe_train$sample_id == '151673',]
+spe_train <- spe_train[,spe_train$sample_id == '151673']
+
+dist_mat <- get_dist_cpp(as.matrix(colData(spe_train)[,c('array_row','array_col')]))
+adj_mat <- nbr_pred(theta(spe_train),rtm_weights,loss_fun = 1)
+# Define distance bins
+bins <- seq(0, max(dist_mat), by = 10)
+
+# Function to calculate averages for a single observation
+process_observation <- function(index) {
+  dist_row <- dist_mat[index, ]  # Get distances for the observation
+  adj_row <- adj_mat[index, ]  # Get corresponding adj_mat row
+  category <- spe_train$spatialLIBD[index]  # Get spatialLIBD category
+  
+  # Create a result data frame to store results for this observation
+  results <- data.frame(
+    BinStart = numeric(),
+    BinEnd = numeric(),
+    AvgSameCategory = numeric(),
+    AvgDifferentCategory = numeric(),
+    MedSameCategory = numeric(),
+    MedDifferentCategory = numeric()
+  )
+  
+  # Process each bin
+  for (i in seq_along(bins[-length(bins)])) {
+    bin_start <- bins[i]
+    bin_end <- bins[i + 1]
+    
+    # Get indices within the current bin
+    bin_indices <- which(dist_row >= bin_start & dist_row < bin_end)
+    
+    if (length(bin_indices) > 0) {
+      # Split into same and different spatialLIBD categories
+      same_category <- bin_indices[spe_train$spatialLIBD[bin_indices] == category]
+      different_category <- bin_indices[spe_train$spatialLIBD[bin_indices] != category]
+      
+      # Calculate averages
+      avg_same <- mean(adj_row[same_category], na.rm = TRUE)
+      avg_different <- mean(adj_row[different_category], na.rm = TRUE)
+      med_same <- median(adj_row[same_category], na.rm = TRUE)
+      med_different <- median(adj_row[different_category], na.rm = TRUE)
+    } else {
+      avg_same <- NA
+      avg_different <- NA
+      med_same <- NA
+      med_different <- NA
+    }
+    
+    # Append to results
+    results <- rbind(
+      results,
+      data.frame(
+        BinStart = bin_start,
+        BinEnd = bin_end,
+        AvgSameCategory = avg_same,
+        AvgDifferentCategory = avg_different,
+        MedSameCategory = med_same,
+        MedDifferentCategory = med_different 
+      )
+    )
+  }
+  
+  return(results)
+}
+
+# Apply the process for each observation
+all_results <- lapply(1:nrow(dist_mat), function(i) {
+  observation_results <- process_observation(i)
+  observation_results$Observation <- i  # Add observation index
+  observation_results$Layer <- spe_train$spatialLIBD[i] 
+  return(observation_results)
+})
+
+# Combine results into a single data frame
+final_results <- do.call(rbind, all_results)
+
+# View final results
+print(final_results)
+
+```
+
+```{r}
+plot_data <- final_results %>%
+  pivot_longer(
+    cols = c(AvgSameCategory, AvgDifferentCategory),
+    names_to = "Category",
+    values_to = "MeanValue"
+  ) %>%
+  mutate(
+    Category = factor(Category, levels = c("AvgSameCategory", "AvgDifferentCategory"),
+                      labels = c("Same-Region", "Cross-Region"))
+  )
+
+# Create the ggplot
+ggplot(plot_data, aes(x = as.factor(BinEnd), y = MeanValue, fill = Category)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_manual(values = c("Same-Region" = "#E69F00", "Cross-Region" = "#56B4E9")) +
+    scale_y_continuous(labels = scales::label_number(accuracy = 0.01)) +
+  labs(
+    x = "Euclidean Distance",
+    y = "Neighbor Prob.",
+    fill = "Category",
+    title = "Neighbor Probability over Distance"
+  ) +
+  ylim(0.5,0.6)+
+  theme_minimal(base_size = 15) +
+  theme(
+    axis.text.x = element_text(hjust = 1),  # Rotate x-axis labels
+    legend.position = "top",
+    axis.line = element_line(color = 'black')
+  )
+```
+
+```{r}
+summary_data <- plot_data %>%
+  group_by(BinEnd, Category) %>%
+  summarise(
+    Mean = mean(MeanValue, na.rm = TRUE),
+    SD = sd(MeanValue, na.rm = TRUE),
+    n = sum(!is.na(MeanValue)),  # Count of non-NA values
+    SE = SD / sqrt(n),
+    .groups = "drop"
+  )
+
+# Create the line graph with SE
+ggplot(summary_data, aes(x = BinEnd, y = Mean, color = Category, fill = Category)) +
+  geom_line(size = 1) +  # Line for the mean
+  geom_ribbon(aes(ymin = Mean - SE, ymax = Mean + SE), alpha = 0.8, color = NA) +  # SE ribbon
+  scale_color_manual(values = c("Same-Region" = "#E69F00", "Cross-Region" = "#56B4E9")) +
+  scale_fill_manual(values = c("Same-Region" = "#F5C981", "Cross-Region" = "#A3D3F5")) +
+  ylim(0.5,0.6)+
+  labs(
+    x = "Euclidean Distance",
+    y = "Neighbor Prob.",
+    color = "Category",
+    fill = "Category",
+    title = "Neighbor Probability over Distance"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    axis.text.x = element_text(hjust = 1),  # Rotate x-axis labels
+    legend.position = "top",
+    axis.line = element_line(color = 'black')
+  )
+
+```

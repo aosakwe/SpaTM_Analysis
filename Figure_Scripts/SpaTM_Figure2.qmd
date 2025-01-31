@@ -1,0 +1,334 @@
+---
+title: "SpaTM Figure 2"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+```{r,message=FALSE,warning=FALSE}
+set.seed(1234) 
+library(SpaTM)
+library(scran)
+library(scater) 
+library(tidyverse)   
+library(Matrix) 
+library(ComplexHeatmap) 
+library(circlize) 
+library(spatialLIBD) 
+library(patchwork) 
+library(tictoc)
+library(torch)
+```
+
+```{r,echo=FALSE,message=FALSE}
+# Load Data
+spe <- readRDS("../data/spe.rds")
+samples <- c("151673","151674","151675","151676","151507")
+spe <- spe[,spe$sample_id %in% samples]
+spe <- spe[,spe$spatialLIBD != 'Unknown']
+spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
+
+scenarios <- list(list(train = c("151673"),test = c('151676','151507')),
+                  list(train = c("151673","151674","151675"),
+                       test = c('151676','151507')))
+
+models <- list()
+############### Number of Topics
+K <- 8
+############ ###
+
+##Remove Mitochondrial genes
+library(EnsDb.Hsapiens.v75)
+gns <- genes(EnsDb.Hsapiens.v75, filter = ~ seq_name == "MT")
+spe <- spe[!rownames(spe) %in% gns$gene_id,]
+## Remove Ribosomal Proteins
+cur_genes <- genes(EnsDb.Hsapiens.v75)$symbol
+cur_genes <- cur_genes[grepl(pattern = "^RP[SL][[:digit:]]|^RP[[:digit:]]|^RPSA",cur_genes)]
+genes_remove <- genes(EnsDb.Hsapiens.v75, filter = ~ symbol %in% cur_genes)$gene_id
+spe <- spe[!rownames(spe) %in% genes_remove,]
+
+# dec <- modelGeneVar(spe)
+# top_hvgs <- getTopHVGs(dec,n = 1000)
+# spe <- spe[top_hvgs,]
+spe$layer <- as.numeric(spe$spatialLIBD) - 1
+
+results <- matrix(0,nrow = 4,ncol = 2)
+rownames(results) <- paste('Scenario ',1:nrow(results),sep = '')
+
+spe <- SpatialTopicExperiment(spe,K = K)
+max_iter <- 100
+
+z <- 1
+for(i in 1:length(scenarios)){
+
+  print(paste("Scenario: ",i,sep = ''))
+  spe_train <- spe[,spe$sample_id %in% scenarios[[i]]$train]
+
+  mlp_layers <- 1
+  classes <- length(unique(spe_train$layer))
+  mlp <- build_mlp(mlp_layers,K,64,classes)
+  
+  #Add train-validation split
+  if (i == 1){
+    spe_val <- spe[,spe$sample_id == '151674']
+    #Top HVGs ####
+    spe_train <- computeGeometricFactors(spe_train)
+    spe_train <- logNormCounts(spe_train)
+    dec <- modelGeneVar(spe_train)
+    top_hvgs <- getTopHVGs(dec,n = 1000)
+    spe_train <- spe_train[top_hvgs,]
+    spe_val <- spe_val[top_hvgs,]
+  } else {
+    spe_train <- computeGeometricFactors(spe_train)
+    spe_train$val <- sample(c(T,F),ncol(spe_train),prob = c(0.3,0.7),replace = TRUE)
+    spe_val <- spe_train[,spe_train$val]
+    spe_train <- spe_train[,!spe_train$val]
+    #Top HVGs ####
+    spe_train <- logNormCounts(spe_train)
+    dec <- modelGeneVar(spe_train)
+    top_hvgs <- getTopHVGs(dec,n = 1000)
+    spe_train <- spe_train[top_hvgs,]
+    spe_val <- spe_val[top_hvgs,]
+  }
+
+  #Remove cells with no counts
+  spe_train <- spe_train[,colSums(counts(spe_train)) > 0]
+  spe_val <- spe_val[,colSums(counts(spe_val)) > 0]
+
+  spe_train <- SpatialTopicExperiment(
+    spe_train,
+    guided = FALSE,
+    labels = NULL,
+    K,
+    hvg = NULL)
+
+  spe_val <- SpatialTopicExperiment(
+      spe_val,
+      guided = FALSE,
+      labels = NULL,
+      K,
+      hvg = NULL)
+  #Train
+  D <- ncol(spe_train)
+  #spe_train <- scGTM(spe_train,K,D,1, maxiter =200, verbal = FALSE)
+  ###
+
+  #Burn-in STM
+  STM_burnin(spe_train,1,5,FALSE,TRUE,FALSE,1e-05,1e-08,mlp,mlp_layers,mlp_epoch = 10,spe_val)
+  mlp <- STM(spe_train,1,max_iter,FALSE,TRUE,FALSE,1e-05,1e-03,mlp,mlp_layers,mlp_epoch = 500,spe_val)
+  ####
+  spe_train <- buildTheta(spe_train)
+  spe_train <- buildPhi(spe_train)
+
+
+  spe_train <- scGTMPredict(spe_train,1,100,FALSE,phi(spe_train))
+  spe_train <- buildTheta(spe_train)
+
+
+  train_pred <- pred_mlp(mlp,theta(spe_train))
+
+  train_acc <- length(which(train_pred == as.numeric(spe_train$spatialLIBD)))*
+      100/ncol(spe_train)
+  print(paste("train Acc: ",train_acc, sep = ''))
+
+  ###
+  spe_val <- scGTMPredict(spe_val,1,100,FALSE,phi(spe_train))
+  spe_val <- buildTheta(spe_val)
+
+
+  val_pred <- pred_mlp(mlp,theta(spe_val))
+
+  val_acc <- length(which(val_pred == as.numeric(spe_val$spatialLIBD)))*
+      100/ncol(spe_val)
+  print(paste("Val Acc: ",val_acc, sep = ''))
+  best_phi <- phi(spe_train)
+  ############################################
+
+  #Store models
+  models[[i]] <- list(spe_train,mlp)
+  ############Predict Test###################
+  
+  for(j in 1:2){
+    test_res <- c()
+    spe_test <- spe[,spe$sample_id %in% scenarios[[i]]$test[j]]
+    ####Top HVGs ####
+    spe_test <- spe_test[top_hvgs,]
+    ######
+
+    spe_test <- SpatialTopicExperiment(
+      spe_test,
+      guided = FALSE,
+      labels = NULL,
+      K,
+      hvg = NULL)
+    spe_test <- scGTMPredict(spe_test,1,100,FALSE,best_phi)
+    spe_test <- buildTheta(spe_test)
+    #Test Accuracy
+
+    test_pred <- pred_mlp(mlp,theta(spe_test))
+    
+    
+    ### RTM-based Smoothing
+    nbr_list <- get_spots(spe_test,'sample_id','int_cell',NULL,dist = 3,loss_fun = 1)
+    smooth_pred <- rtm_smooth(spe_test,test_pred,nbr_list = nbr_list)
+    #smooth_pred <-  rtm_smooth(spe_test,test_pred,k = 5)
+    #for (m in 1:10){
+    #  smooth_pred <-  rtm_smooth(spe_test,smooth_pred,k = 5)
+    #}
+    test_acc <- length(which(test_pred == as.numeric(spe_test$spatialLIBD)))*
+      100/ncol(spe_test)
+    print(paste(scenarios[[i]]$test[j], " || Test Acc: ",test_acc, sep = ''))
+    test_res <- c(test_res,test_acc)
+    #results[i,j] <- c(test_acc)
+    test_acc <- length(which(smooth_pred == as.numeric(spe_test$spatialLIBD)))*
+      100/ncol(spe_test)
+    print(paste(scenarios[[i]]$test[j], " || Smooth Test Acc: ",test_acc, sep = ''))
+    test_res <- c(test_res,test_acc)
+    #spe_test$Pred <- smooth_pred
+    #vis_clus(spe_test,clustervar = 'Pred')
+    #results[i,j+1] <- test_acc
+    print('=============')
+    results[z,] <- test_res
+    z <- z + 1
+    #test_true <- as.numeric(spe_test$spatialLIBD)
+    # for (z in 1:max(test_true)){
+    #   cur_idx <- which(test_true == z)
+    #   print(levels(spe_test$spatialLIBD)[z])
+    #   print(length(which(test_pred[cur_idx] == test_true[cur_idx]))*100/length(cur_idx))
+    # }
+  }
+  
+  #####################################
+}
+print(results)
+
+backup <- phi(spe_train)
+```
+
+## Panel B
+
+```{r}
+
+
+vis_clus(in_spe,clustervar = 'Pred')
+vis_clus(in_spe,clustervar = 'smooth')
+vis_clus(in_spe,clustervar = 'spatialLIBD')
+
+vis_clus(cross_spe,clustervar = 'Pred')
+vis_clus(cross_spe,clustervar = 'smooth')
+vis_clus(cross_spe,clustervar = 'spatialLIBD')
+
+```
+
+## Panel C
+
+```{r}
+for (z in 1:ncol(theta(in_spe))){
+  in_spe$Topic <- theta(in_spe)[,z]
+  p <- vis_gene(in_spe,geneid = 'Topic',minCount = -0.1) + labs(title =paste(z))
+  print(p)
+}
+for (z in 1:ncol(theta(cross_spe))){
+  cross_spe$Topic <- theta(cross_spe)[,z]
+  p <- vis_gene(cross_spe,geneid = 'Topic',minCount = -0.1) + labs(title =paste(z))
+  print(p)
+}
+```
+
+## Panel D
+
+```{r}
+phi(spe_train) <- backup
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+ensembl_ids <- rownames(spe_train)
+
+# Get gene symbols for the given Ensembl IDs
+results <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),  # Define the information to retrieve
+  filters = "ensembl_gene_id",  # Define the filter (search by Ensembl ID)
+  values = ensembl_ids,  # Values to filter by (your list of Ensembl IDs)
+  mart = ensembl  # The connection object
+)
+
+temp <- phi(spe_train)
+temp <- temp[results$ensembl_gene_id,]
+table(results$ensembl_gene_id == rownames(temp))
+rownames(temp) <- results$hgnc_symbol
+phi(spe_train) <- temp
+
+
+
+viz_phi <- phi(spe_train)
+#viz_phi <- t(apply(viz_phi,1,function(a){a/sum(a)}))
+top10_k <- as.vector(sapply(1:ncol(viz_phi),function(K){
+  top_10 <- order(viz_phi[,K],decreasing = T)[1:10]
+  viz_phi[top_10,] <- 0
+  top_10
+}))
+
+viz_phi <- phi(spe_train)[unique(top10_k),]
+
+
+
+sig_genes <- readRDS("../../scGTM/misc/DLPFC_markers.rds")
+#temp <- sig_genes[order(sig_genes$gene),c('test','gene','stat')]
+
+gene_labels <- c()
+second_labels <- c()
+for (gene in rownames(viz_phi)){
+  temp <- sig_genes[sig_genes$gene == gene,]
+  if (nrow(temp) == 1){
+    gene_labels <- c(gene_labels,temp$test)
+    second_labels <- c(second_labels,NA)
+  }
+  else if (nrow(temp) > 1){
+    gene_labels <- c(gene_labels,temp$test[which.max(temp$stat)])
+    second_labels <- c(second_labels,temp$test[order(temp$stat)][1])
+    print(temp)
+    print(temp$test[order(temp$stat)])
+  } else {
+    gene_labels <- c(gene_labels,NA)
+    second_labels <- c(second_labels,NA)
+  }
+}
+
+
+# Row annotations
+row_annotations <- data.frame(
+  Marker.1 = gene_labels,
+  Marker.2 = second_labels
+)
+rownames(row_annotations) <- rownames(viz_phi)
+
+# Define custom colors
+annotation_colors <- list(
+  Marker.1 = c('Layer1' = "#b2df8a",
+               'Layer2' = "#e41a1c",
+               'Layer3' = "#377eb8",
+               'Layer4' = "#4daf4a",
+               'Layer5' = "#ff7f00",
+               'Layer6' = "gold",
+               'WM' = "#a65628"),
+    Marker.2 = c('Layer1' = "#b2df8a",
+               'Layer2' = "#e41a1c",
+               'Layer3' = "#377eb8",
+               'Layer4' = "#4daf4a",
+               'Layer5' = "#ff7f00",
+               'Layer6' = "gold",
+               'WM' = "#a65628")
+)
+
+col_scale <- colorRamp2(c(min(viz_phi), min(0.05,max(viz_phi))), c("white", "red"))
+#col_scale <- colorRamp2(c(min(viz_phi), max(viz_phi)), c("white", "red"))
+viz_phi[viz_phi > 0.05] <- 0.05
+pheatmap(viz_phi,cluster_cols = F,
+         cluster_rows = F,color = col_scale,
+         heatmap_legend_param = list(
+             title = "Topic Weights",
+             at = c(round(min(viz_phi,0)),
+                    max(viz_phi))),
+         annotation_row = row_annotations,
+         annotation_colors = annotation_colors,
+         cellwidth = 15, fontsize_row = 8)  
+```

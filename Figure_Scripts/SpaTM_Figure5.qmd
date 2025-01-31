@@ -1,0 +1,452 @@
+---
+title: "Figure 5 Panels"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+```{r,message=FALSE,warning=FALSE}
+set.seed(1234) 
+library(SpaTM)
+library(scran)
+library(scater) 
+library(tidyverse)   
+library(Matrix) 
+library(ComplexHeatmap) 
+library(circlize) 
+library(spatialLIBD) 
+library(patchwork) 
+library(tictoc)
+library(torch)
+```
+
+```{r}
+# Load Data
+spe <- readRDS("../data/spe.rds")
+samples <- c("151673","151674")
+spe <- spe[,spe$sample_id %in% samples]
+spe <- spe[,spe$spatialLIBD != 'Unknown']
+spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
+
+scenarios <- list(list(train = c("151673"),test = c('151673')))
+
+layer_acc <- matrix(0,nrow = 4,ncol = length(unique(spe$spatialLIBD)))
+############### Number of Topics
+K <- 8
+############ ###
+
+##Remove Mitochondrial genes
+library(EnsDb.Hsapiens.v75)
+gns <- genes(EnsDb.Hsapiens.v75, filter = ~ seq_name == "MT")
+spe <- spe[!rownames(spe) %in% gns$gene_id,]
+## Remove Ribosomal Proteins
+cur_genes <- genes(EnsDb.Hsapiens.v75)$symbol
+cur_genes <- cur_genes[grepl(pattern = "^RP[SL][[:digit:]]|^RP[[:digit:]]|^RPSA",cur_genes)]
+genes_remove <- genes(EnsDb.Hsapiens.v75, filter = ~ symbol %in% cur_genes)$gene_id
+spe <- spe[!rownames(spe) %in% genes_remove,]
+spe$layer <- as.numeric(spe$spatialLIBD) - 1
+
+spe <- SpatialTopicExperiment(spe,K = K)
+
+```
+
+## STM
+
+```{r}
+max_iter <- 100
+elbo_mat <- matrix(0,max_iter,5)
+z <- 1
+
+spe_train <- spe[,spe$sample_id %in% '151673']
+
+mlp_layers <- 1
+classes <- length(unique(spe_train$layer))
+mlp <- build_mlp(mlp_layers,K,64,classes)
+
+#Add train-validation split
+
+spe_val <- spe[,spe$sample_id == '151674']
+#Top HVGs ####
+spe_train <- computeGeometricFactors(spe_train)
+spe_train <- logNormCounts(spe_train)
+dec <- modelGeneVar(spe_train)
+top_hvgs <- getTopHVGs(dec,n = 1000)  ##Update
+spe_train <- spe_train[top_hvgs,]
+spe_val <- spe_val[top_hvgs,]
+
+#Remove cells with no counts
+spe_train <- spe_train[,colSums(counts(spe_train)) > 0]
+spe_val <- spe_val[,colSums(counts(spe_val)) > 0]
+
+spe_train <- SpatialTopicExperiment(
+  spe_train,
+  guided = FALSE,
+  labels = NULL,
+  K,
+  hvg = NULL)
+
+spe_val <- SpatialTopicExperiment(
+    spe_val,
+    guided = FALSE,
+    labels = NULL,
+    K,
+    hvg = NULL)
+#Train
+D <- ncol(spe_train)
+#spe_train <- scGTM(spe_train,K,D,1, maxiter =200, verbal = FALSE)
+###
+
+#Burn-in STM
+STM_burnin(spe_train,1,5,FALSE,TRUE,FALSE,1e-05,1e-08,mlp,mlp_layers,mlp_epoch = 10,elbo_mat,spe_val) 
+mlp <- STM(spe_train,1,max_iter,FALSE,TRUE,FALSE,1e-05,1e-03,mlp,mlp_layers,mlp_epoch = 500,elbo_mat,spe_val)
+####
+spe_train <- buildTheta(spe_train)
+spe_train <- buildPhi(spe_train)
+
+
+spe_train <- scGTMPredict(spe_train,1,100,FALSE,phi(spe_train))
+spe_train <- buildTheta(spe_train)
+
+
+train_pred <- pred_mlp(mlp,theta(spe_train))
+
+train_acc <- length(which(train_pred == as.numeric(spe_train$spatialLIBD)))*
+    100/ncol(spe_train)
+print(paste("train Acc: ",train_acc, sep = ''))
+
+stm_spe <- spe_train
+stm_spe$Layer <- levels(spe$spatialLIBD)[train_pred]
+vis_clus(stm_spe,clustervar = 'Layer')
+```
+
+## RTM
+
+```{r}
+
+max_iter <- 200
+lr <- 0.00001
+K <- 8
+n_genes <- 3000
+nbr_dist <- 3
+spe_train <- spe[,spe$sample_id %in% c('151673')]
+spe_train$spatialLIBD <- as.factor(as.character(spe_train$spatialLIBD))
+
+##Get Top genes
+spe_train <- computeGeometricFactors(spe_train)
+spe_train <- logNormCounts(spe_train)
+dec <- modelGeneVar(spe_train)
+top_hvgs <- getTopHVGs(dec,n = n_genes)
+spe_train <- spe_train[top_hvgs,]
+# 
+#Remove cells & genes with no counts
+spe_train <- spe_train[,colSums(counts(spe_train)) > 0]
+spe_train <- spe_train[rowSums(counts(spe_train)) >0,]
+top_hvgs <- rownames(spe_train)
+
+spe_train <- SpatialTopicExperiment(
+ spe_train,
+ guided = FALSE,
+ labels = NULL,
+ K,
+ hvg = NULL)
+
+
+##Define Neighbors
+#nbr_dist <- dist_params[i]
+nbr_list <- get_spots(spe_train,'sample_id','int_cell',NULL,dist = nbr_dist,loss_fun = 1)
+
+#Train
+D <- ncol(spe_train)
+####Run RTM######
+rtm_weights <- train_RTM(counts(spe_train),
+         spe_train$int_cell,
+         rowData(spe_train)$gene_ints,
+         nbr_list,
+         alphaPrior(spe_train),
+         betaPrior(spe_train),
+         K,
+         ncol(spe_train),
+         ndk(spe_train),
+         nwk(spe_train),
+         6,
+         max_iter,
+         verbal = TRUE,
+         zero_gamma = FALSE,
+         rand_gamma = TRUE,#FALSE,#
+         thresh = 0.00001,
+         lr =lr,
+         rho = 50000,
+         loss_fun = 1,
+         m_update = TRUE)
+
+
+spe_train <- buildTheta(spe_train)
+spe_train <- buildPhi(spe_train)
+spe_test <- scGTMPredict(spe_train,1,100,FALSE,phi(spe_train))
+spe_test <- buildTheta(spe_test)
+# 
+# 
+ ##Build Adjacency Matrices TODO
+reducedDim(spe_test,'ADJ') <- get_all_pred(spe_test,
+                        rtm_weights,loss_fun = 1)
+reducedDim(spe_test,'Theta') <- theta(spe_test)
+spe_test <- runPCA(spe_test,dimred = 'ADJ')
+
+clust_input <- 'PCA'
+library(bluster)
+lei_clust <-  clust_optim(spe_test,7,100,X = clust_input, k = 10,alg = 'leiden')
+spe_test$leiden <- lei_clust$clustering %>% as.character()
+spe_test$leiden <- rtm_smooth(spe_test,spe_test$leiden,nbr_list)
+rtm_spe <- spe_test
+vis_clus(rtm_spe,clustervar = 'leiden')
+```
+
+## GTM
+
+```{r}
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+#Remove MT + RP
+mt_genes <- getBM(
+  attributes = c("hgnc_symbol", "chromosome_name"),
+  filters = "chromosome_name",
+  values = "MT",
+  mart = ensembl
+)
+ribosomal_genes <- getBM(
+  attributes = c("hgnc_symbol", "gene_biotype"),
+  filters = "biotype",
+  values = c("rRNA", "ribosomal"),
+  mart = ensembl
+)
+```
+
+```{r}
+n_gene <- 2500
+
+#for (n_gene in c(1000,2500,5000,10000,15000)){
+  mdd <- readRDS("../data/mdd_sce_full.rds")
+  mdd <- mdd[,mdd$DF.classifications == 'Singlet' & mdd$Condition != 'Case' & mdd$Broad != 'Mix' & mdd$Sex == 'Female']
+  rm.genes <- c(mt_genes$hgnc_symbol,ribosomal_genes$hgnc_symbol)
+  mdd <- mdd[!rownames(mdd) %in% rm.genes,]
+  mdd <- SingleCellTopicExperiment(mdd,T,'Broad',hvg = n_gene)
+  gc()
+  mdd <- scGTM(mdd,K = ncol(alphaPrior(mdd)),D = ncol(mdd),num_threads = 6,maxiter = 100,verbal = F)
+  mdd <- buildTheta(mdd)
+  mdd <- buildPhi(mdd)
+  colnames(phi(mdd)) <- colnames(alphaPrior(mdd))
+  colnames(theta(mdd)) <- colnames(alphaPrior(mdd))
+  mdd$Pred <- apply(theta(mdd),1,which.max)
+  mdd$Pred <- colnames(alphaPrior(mdd))[mdd$Pred]
+  mdd$Pred <- factor(mdd$Pred,levels = levels(mdd$Broad))
+  #table(mdd$Broad,mdd$Pred)
+  print(n_gene)
+  print(sum(mdd$Pred == mdd$Broad)*100/ncol(mdd))
+  print('====')
+#}
+
+```
+
+```{r}
+
+gtm_spe <- spe[,spe$sample_id == '151673']
+
+K <- ncol(theta(mdd))
+gtm_spe <- SpatialTopicExperiment(gtm_spe,K = K)
+
+
+ensembl_ids <- rownames(gtm_spe)
+
+#Get gene symbols for the given Ensembl IDs
+results <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),  # Define the information to retrieve
+  filters = "ensembl_gene_id",  # Define the filter (search by Ensembl ID)
+  values = ensembl_ids,  # Values to filter by (your list of Ensembl IDs)
+  mart = ensembl  # The connection object
+)
+
+
+temp <- gtm_spe
+temp <- temp[results$ensembl_gene_id,]
+table(results$ensembl_gene_id == rownames(temp))
+rownames(temp) <- results$hgnc_symbol
+gtm_spe <- temp
+
+keep.genes <- intersect(rownames(gtm_spe),rownames(mdd))
+gtm_spe <- gtm_spe[keep.genes,]
+rm('temp')
+gc()
+
+mdd <- mdd[keep.genes,]
+phi(mdd) <- phi(mdd)[keep.genes,]
+#phi(mdd) <- apply(phi(mdd),2,function(a){a/sum(a)})
+gc()
+if (any(rownames(gtm_spe) != rownames(phi(mdd)))){stop("Mismatch!!")}
+
+gtm_spe <- SpatialTopicExperiment(gtm_spe,K = K)
+gtm_spe <- scGTMPredict(gtm_spe,6,100,T,phi(mdd))
+gtm_spe <- buildTheta(gtm_spe)
+colnames(theta(gtm_spe)) <- colnames(theta(mdd))
+for (i in 1:ncol(theta(gtm_spe))){
+  gtm_spe$Topic <- theta(gtm_spe)[,i]
+  p <- vis_gene(gtm_spe,geneid = 'Topic') + 
+    labs(title = colnames(phi(mdd))[i])
+  print(p)
+}
+
+```
+
+## Box Plots
+
+```{r}
+theta_spe <- theta(gtm_spe) %>%
+  as.data.frame()
+theta_spe$Layer <- stm_spe$Alt
+theta_spe$Cluster <- rtm_spe$leiden
+theta_spe$Cluster <- factor(theta_spe$Cluster,
+                            levels = as.character(c(2,4,3,6,1,5,7)))
+theta_spe <- theta_spe %>%
+  dplyr::filter(Layer == 'WM')
+
+# Boxplot without whiskers and with SD error bars
+p1 <- theta_spe %>%
+  dplyr::filter(Cluster %in% c('2','3', '4')) %>%
+  ggplot(aes(x = Cluster, y = Oli, fill = Cluster)) +
+  geom_boxplot(outlier.shape = NA) +  
+  scale_fill_brewer(palette = "Set2") +  # Custom colors
+  labs(x = "SpaTM-R Cluster", y = "Oligodendrocyte Proportion", fill = "Cluster") +
+    theme_minimal(base_size = 18) +  # Increase base font size to 14
+    theme(
+        axis.line = element_line(color = "black",size = 1), # Add x and y axis lines
+        panel.border = element_blank(), # Remove panel border
+        axis.ticks = element_line(color = "black"), # Keep axis ticks
+        axis.text = element_text(size = 16), # Increase axis text size
+        axis.title = element_text(size = 20), # Increase axis title size
+        legend.title = element_text(size = 14), # Increase legend title size
+        legend.text = element_text(size = 12) # Increase legend text size
+    )
+
+
+p2 <- theta_spe %>%
+  dplyr::filter(Cluster %in% c('2','3', '4')) %>%
+  ggplot(aes(x = Cluster, y = ExN, fill = Cluster)) +
+  geom_boxplot(outlier.shape = NA) + 
+  scale_fill_brewer(palette = "Set2") +  # Custom colors
+  labs(x = "SpaTM-R Cluster", y = "Excitatory Neuron Proportion", fill = "Cluster") +
+    theme_minimal(base_size = 18) +  # Increase base font size to 14
+    theme(
+        axis.line = element_line(color = "black",size = 1), # Add x and y axis lines
+        panel.border = element_blank(), # Remove panel border
+        axis.ticks = element_line(color = "black"), # Keep axis ticks
+        axis.text = element_text(size = 16), # Increase axis text size
+        axis.title = element_text(size = 20), # Increase axis title size
+        legend.title = element_text(size = 14), # Increase legend title size
+        legend.text = element_text(size = 12) # Increase legend text size
+    )
+
+p3 <- theta_spe %>%
+  dplyr::filter(Cluster %in% c('2','3', '4')) %>%
+  ggplot(aes(x = Cluster, y = Ast, fill = Cluster)) +
+  geom_boxplot(outlier.shape = NA) + 
+  scale_fill_brewer(palette = "Set2") +  # Custom colors
+  labs(x = "SpaTM-R Cluster", y = "Astrocyte Proportion", fill = "Cluster") +
+    theme_minimal(base_size = 18) +  # Increase base font size to 14
+    theme(
+        axis.line = element_line(color = "black",size = 1), # Add x and y axis lines
+        panel.border = element_blank(), # Remove panel border
+        axis.ticks = element_line(color = "black"), # Keep axis ticks
+        axis.text = element_text(size = 16), # Increase axis text size
+        axis.title = element_text(size = 20), # Increase axis title size
+        legend.title = element_text(size = 14), # Increase legend title size
+        legend.text = element_text(size = 12) # Increase legend text size
+    )
+
+
+
+
+
+```
+
+```{r}
+theta_spe <- theta(gtm_spe) %>%
+  as.data.frame()
+theta_spe$Layer <- stm_spe$Alt
+theta_spe$Cluster <- rtm_spe$leiden
+
+
+df_proportions <- theta_spe %>%
+  group_by(Cluster, Layer) %>%
+  dplyr::filter(Cluster %in% c('3','4','2')) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(Cluster) %>%
+  mutate(Proportion = Count / sum(Count))
+
+# Create the stacked bar plot
+p4 <- ggplot(df_proportions, aes(x = Cluster, y = Proportion, fill = Layer)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(
+    title = "Proportion of Layers in Each Cluster",
+    x = "Cluster",
+    y = "Proportion"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal()
+```
+
+## Plots
+
+```{r}
+theta_spe <- theta(stm_spe) %>%
+  as.data.frame()
+theta_spe$Layer <- stm_spe$Alt
+theta_spe$Cluster <- rtm_spe$leiden
+theta_spe$Cluster <- factor(theta_spe$Cluster,
+                            levels = as.character(c(2,4,3,6,1,5,7)))
+theta_spe <- theta_spe %>%
+  dplyr::filter(Layer == 'WM')
+colnames(theta_spe) <- str_replace(colnames(theta_spe),"-",'')
+# Filter and summarize data
+summary_data <- theta_spe %>%
+  dplyr::filter(Cluster %in% c('2','3', '4')) %>%
+  group_by(Cluster) %>%
+  summarise(mean = mean(Topic7), sd = sd(Topic7))
+
+# Boxplot without whiskers and with SD error bars
+p5 <- theta_spe %>%
+  dplyr::filter(Cluster %in% c('2','3', '4')) %>%
+  ggplot(aes(x = Cluster, y = Topic7, fill = Cluster)) +
+  geom_boxplot(outlier.shape = NA) +  
+  scale_fill_brewer(palette = "Set2") +  # Custom colors
+  labs(x = "SpaTM-R Cluster", y = "SpaTM-S Topic 7 Weight", fill = "Cluster") +
+    theme_minimal(base_size = 18) +  # Increase base font size to 14
+    theme(
+        axis.line = element_line(color = "black",size = 1), # Add x and y axis lines
+        panel.border = element_blank(), # Remove panel border
+        axis.ticks = element_line(color = "black"), # Keep axis ticks
+        axis.text = element_text(size = 16), # Increase axis text size
+        axis.title = element_text(size = 20), # Increase axis title size
+        legend.title = element_text(size = 14), # Increase legend title size
+        legend.text = element_text(size = 12) # Increase legend text size
+    )
+
+```
+
+```{r}
+vis_clus(rtm_spe,clustervar = 'leiden',
+         colors = c("#6dc39e",
+                 "#8c9fc8",
+                 "#e68ac0",
+                 "#a6c381",
+                  "#f7c73d",
+                 "#e0bb96",
+                 "#fa8d5f",
+                 "#d9534f"))
+vis_clus(stm_spe,clustervar = 'Alt')
+gtm_spe$Topic <- theta(gtm_spe)[,'Oli']
+vis_gene(gtm_spe,geneid = 'Topic')
+p1
+p2
+p3
+p4
+p5
+```

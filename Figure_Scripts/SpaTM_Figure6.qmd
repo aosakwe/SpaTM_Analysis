@@ -1,0 +1,782 @@
+---
+title: "SpaTM Figure 6"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+```{r,message=FALSE,warning=FALSE}
+set.seed(1234) 
+library(SpaTM)
+library(scran)
+library(scater) 
+library(tidyverse)   
+library(Matrix) 
+library(ComplexHeatmap) 
+library(circlize) 
+library(spatialLIBD) 
+library(patchwork) 
+library(tictoc)
+library(torch)
+```
+
+## Train Model
+
+```{r,echo=FALSE,message=FALSE}
+# Load Data
+spe <- readRDS("../data/spe.rds")
+samples <- c("151673","151674")
+spe <- spe[,spe$sample_id %in% samples]
+spe <- spe[,spe$spatialLIBD != 'Unknown']
+spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
+
+############### Number of Topics
+K <- 8
+############ ###
+
+##Remove Mitochondrial genes
+library(EnsDb.Hsapiens.v75)
+gns <- genes(EnsDb.Hsapiens.v75, filter = ~ seq_name == "MT")
+spe <- spe[!rownames(spe) %in% gns$gene_id,]
+## Remove Ribosomal Proteins
+cur_genes <- genes(EnsDb.Hsapiens.v75)$symbol
+cur_genes <- cur_genes[grepl(pattern = "^RP[SL][[:digit:]]|^RP[[:digit:]]|^RPSA",cur_genes)]
+genes_remove <- genes(EnsDb.Hsapiens.v75, filter = ~ symbol %in% cur_genes)$gene_id
+spe <- spe[!rownames(spe) %in% genes_remove,]
+
+
+spe$layer <- as.numeric(spe$spatialLIBD) - 1
+
+
+spe <- SpatialTopicExperiment(spe,K = K)
+max_iter <- 100
+elbo_mat <- matrix(0,max_iter,5)
+
+
+spe_train <- spe
+
+mlp_layers <- 1
+classes <- length(unique(spe_train$layer))
+mlp <- build_mlp(mlp_layers,K,64,classes)
+  
+
+spe_val <- spe[,spe$sample_id == '151674']
+#Top HVGs ####
+spe_train <- computeGeometricFactors(spe_train)
+spe_train <- logNormCounts(spe_train)
+dec <- modelGeneVar(spe_train)
+top_hvgs <- getTopHVGs(dec,n = 1000)
+spe_train <- spe_train[top_hvgs,]
+spe_val <- spe_val[top_hvgs,]
+
+#Remove cells with no counts
+spe_train <- spe_train[,colSums(counts(spe_train)) > 0]
+spe_val <- spe_val[,colSums(counts(spe_val)) > 0]
+
+spe_train <- SpatialTopicExperiment(
+  spe_train,
+  guided = FALSE,
+  labels = NULL,
+  K,
+  hvg = NULL)
+
+spe_val <- SpatialTopicExperiment(
+    spe_val,
+    guided = FALSE,
+    labels = NULL,
+    K,
+    hvg = NULL)
+
+
+#Burn-in STM
+STM_burnin(spe_train,1,5,FALSE,TRUE,FALSE,1e-05,1e-08,mlp,mlp_layers,mlp_epoch = 10,elbo_mat,spe_val)
+mlp <- STM(spe_train,1,max_iter,FALSE,TRUE,FALSE,1e-05,1e-03,mlp,mlp_layers,mlp_epoch = 500,elbo_mat,spe_val)
+spe_train <- buildTheta(spe_train)
+spe_train <- buildPhi(spe_train)
+
+
+spe_train <- scGTMPredict(spe_train,1,100,FALSE,phi(spe_train))
+spe_train <- buildTheta(spe_train)
+
+
+train_pred <- pred_mlp(mlp,theta(spe_train))
+
+train_acc <- length(which(train_pred == as.numeric(spe_train$spatialLIBD)))*
+    100/ncol(spe_train)
+print(paste("train Acc: ",train_acc, sep = ''))
+
+spe_train$Pred <- train_pred
+vis_clus(spe_train,clustervar = 'Pred')
+backup <- phi(spe_train)
+```
+
+## Load MDD
+
+```{r,message=FALSE,warning=FALSE}
+#Save time and use pre-trained model
+#spe_train <- readRDS("../Final_Figures/Fig6/stm_spe_train.rds")
+#mlp <- torch_load("../Final_Figures/Fig6/mlp.torch")
+mdd <- readRDS("../data/mdd_sce_full.rds")
+mdd <- mdd[,mdd$DF.classifications == 'Singlet']
+
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+ensembl_ids <- rownames(spe_train)
+
+#Get gene symbols for the given Ensembl IDs
+results <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),  # Define the information to retrieve
+  filters = "ensembl_gene_id",  # Define the filter (search by Ensembl ID)
+  values = ensembl_ids,  # Values to filter by (your list of Ensembl IDs)
+  mart = ensembl  # The connection object
+)
+
+temp <- phi(spe_train)
+temp <- temp[results$ensembl_gene_id,]
+table(results$ensembl_gene_id == rownames(temp))
+rownames(temp) <- results$hgnc_symbol
+phi(spe_train) <- temp
+
+stm_phi <- phi(spe_train)
+
+```
+
+```{r}
+K <- ncol(stm_phi)
+keep.genes <- intersect(rownames(stm_phi),rownames(mdd))
+stm_phi <- stm_phi[keep.genes,]
+
+mdd <- mdd[keep.genes,]
+gc()
+if (any(rownames(stm_phi) != rownames(mdd))){stop("Mismatch!!")}
+```
+
+```{r}
+mdd <- SingleCellTopicExperiment(mdd,
+                              K = K)
+mdd$sample <- sample(1:3,ncol(mdd),replace = TRUE)
+mdd2 <- mdd[,mdd$sample == 2]
+mdd3 <- mdd[,mdd$sample == 3]
+mdd <- mdd[,mdd$sample == 1]
+gc()
+
+mdd <- SingleCellTopicExperiment(mdd,
+                              K = K)
+mdd2 <- SingleCellTopicExperiment(mdd2,
+                              K = K)
+mdd3 <- SingleCellTopicExperiment(mdd3,
+                              K = K)
+
+mdd <- scGTMPredict(mdd,6,maxiter = 150,verbal = T, phi = stm_phi)
+mdd2 <- scGTMPredict(mdd2,6,maxiter = 150,verbal = T, phi = stm_phi)
+mdd3 <- scGTMPredict(mdd3,6,maxiter = 150,verbal = T, phi = stm_phi)
+
+mdd <- buildTheta(mdd)
+mdd2 <- buildTheta(mdd2)
+mdd3 <- buildTheta(mdd3)
+
+mdd_pred <- c(pred_mlp(mlp,theta(mdd)),
+              pred_mlp(mlp,theta(mdd2)),
+              pred_mlp(mlp,theta(mdd3)))
+mdd_sample <- c(mdd$Sample,mdd2$Sample,mdd3$Sample)
+mdd_case <- c(mdd$Condition,mdd2$Condition,mdd3$Condition)
+mdd_sex <- c(mdd$Sex,mdd2$Sex,mdd3$Sex)
+mdd_barcode <- c(colnames(mdd),colnames(mdd2),colnames(mdd3))
+mdd_theta <- rbind(theta(mdd),theta(mdd2),theta(mdd3))
+mdd <- readRDS("../data/mdd_sce_full.rds")
+gc()
+
+rm('mdd2')
+rm('mdd3')
+gc()
+mdd <- mdd[,mdd_barcode]
+mdd_theta <- mdd_theta[mdd_barcode,]
+mdd$Layer <- levels(spe_train$spatialLIBD)[mdd_pred]
+table(mdd$Condition == mdd_case)
+table(mdd$Sex == mdd_sex)
+table(mdd$Layer,mdd$Broad)
+layer_prob <- mlp(mdd_theta)
+layer_prob <- as.matrix(layer_prob)
+stm_mdd <- colData(mdd)
+```
+
+## Global MDD Effect
+
+```{r}
+prop_list <- lapply(dimnames(table(mdd$Broad,mdd$Layer,mdd$Sample))[[3]], function(sample) {
+  temp <- table(mdd$Broad,mdd$Layer,mdd$Sample)[, , sample]
+  temp <- apply(temp,1,function(a){a/sum(a)}) %>%
+    t()
+})
+names(prop_list) <- dimnames(table(mdd$Broad,mdd$Layer,mdd$Sample))[[3]]
+condition <- match(names(prop_list),mdd$Sample)
+condition <- mdd$Condition[condition]
+mdd_mat <- Reduce("+", prop_list[condition == 'Case']) %>%
+  apply(1,function(a){a/sum(a)})
+control_mat <- Reduce("+", prop_list[condition != 'Case']) %>%
+  apply(1,function(a){a/sum(a)})
+
+
+
+pheatmap(mdd_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "MDD Layer Proportions by Cell Type")
+
+pheatmap(control_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "Control Layer Proportions by Cell Type")
+#saveRDS(plot_list,paste(prefix,"plots.rds",sep = ''))
+pheatmap(mdd_mat - control_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "Change in Layer Proportions by Cell Type")
+
+
+```
+
+## Male MDD Effect
+
+```{r}
+prop_list <- lapply(dimnames(table(mdd$Broad[mdd$Sex == 'Male'],
+                                   mdd$Layer[mdd$Sex == 'Male'],
+                                   mdd$Sample[mdd$Sex == 'Male']))[[3]], function(sample) {
+  temp <- table(mdd$Broad[mdd$Sex == 'Male'],
+                mdd$Layer[mdd$Sex == 'Male'],
+                mdd$Sample[mdd$Sex == 'Male'])[, , sample]
+  temp <- apply(temp,1,function(a){a/sum(a)}) %>%
+    t()
+})
+names(prop_list) <- dimnames(table(mdd$Broad[mdd$Sex == 'Male'],
+                mdd$Layer[mdd$Sex == 'Male'],
+                mdd$Sample[mdd$Sex == 'Male']))[[3]]
+condition <- match(names(prop_list),mdd$Sample[mdd$Sex == 'Male'])
+condition <- mdd$Condition[condition]
+mdd_mat <- Reduce("+", prop_list[condition == 'Case']) %>%
+  apply(1,function(a){a/sum(a)})
+control_mat <- Reduce("+", prop_list[condition != 'Case']) %>%
+  apply(1,function(a){a/sum(a)})
+
+
+
+pheatmap(mdd_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "Male MDD Layer Proportions by Cell Type")
+
+pheatmap(control_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "Male Control Layer Proportions by Cell Type")
+#saveRDS(plot_list,paste(prefix,"plots.rds",sep = ''))
+pheatmap(mdd_mat - control_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "Male-MDD Change in Layer Proportions by Cell Type")
+```
+
+## Female MDD Effect
+
+```{r}
+
+prop_list <- lapply(dimnames(table(mdd$Broad[mdd$Sex != 'Male'],
+                                   mdd$Layer[mdd$Sex != 'Male'],
+                                   mdd$Sample[mdd$Sex != 'Male']))[[3]], function(sample) {
+  temp <- table(mdd$Broad[mdd$Sex != 'Male'],
+                mdd$Layer[mdd$Sex != 'Male'],
+                mdd$Sample[mdd$Sex != 'Male'])[, , sample]
+  temp <- apply(temp,1,function(a){a/sum(a)}) %>%
+    t()
+})
+names(prop_list) <- dimnames(table(mdd$Broad[mdd$Sex != 'Male'],
+                mdd$Layer[mdd$Sex != 'Male'],
+                mdd$Sample[mdd$Sex != 'Male']))[[3]]
+condition <- match(names(prop_list),mdd$Sample[mdd$Sex != 'Male'])
+condition <- mdd$Condition[condition]
+mdd_mat <- Reduce("+", prop_list[condition == 'Case']) %>%
+  apply(1,function(a){a/sum(a)})
+control_mat <- Reduce("+", prop_list[condition != 'Case']) %>%
+  apply(1,function(a){a/sum(a)})
+
+
+
+pheatmap(mdd_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "Female MDD Layer Proportions by Cell Type")
+
+pheatmap(control_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "Female Control Layer Proportions by Cell Type")
+#saveRDS(plot_list,paste(prefix,"plots.rds",sep = ''))
+pheatmap(mdd_mat - control_mat,
+         cluster_rows = F,
+         cluster_cols = F,
+         main = "Female-MDD Change in Layer Proportions by Cell Type")
+```
+
+```{r}
+sex_var <- 'Female'
+celltype <- 'ExN'
+layers <- unique(mdd$Layer)#c('L2','L3')
+broad_plots <- list()
+broad_results <- list()
+for (sex_var in c('Male','Female')){
+  for (celltype in unique(mdd$Broad)){
+    sample_prop <- table(mdd$Sample[mdd$Broad == celltype & mdd$Sex == sex_var],
+                         mdd$Layer[mdd$Broad == celltype & mdd$Sex == sex_var]) %>% 
+      as.matrix() 
+
+    sample_prop <- apply(sample_prop,1,function(a){a/sum(a)}) %>% t() %>%
+      as.data.frame()
+    
+    sample_prop$Condition <- mdd$Condition[match(rownames(sample_prop),mdd$Sample)]
+    sample_prop$Sex <- mdd$Sex[match(rownames(sample_prop),mdd$Sample)]
+    library(reshape2)
+    sample_prop <-  melt(sample_prop) %>%  
+      dplyr::filter(variable %in% layers)
+    
+    
+    # Compute summary statistics (mean and SD) for each group
+    summary_data <- sample_prop %>%
+        group_by(Condition, variable) %>%
+        summarise(
+            mean_value = mean(value),
+            sd_value = sd(value),
+            .groups = 'drop'
+        )
+    
+    # Plot with boxplots and error bars
+    p <-ggplot(sample_prop, aes(x = Condition, y = value, fill = Condition)) + 
+          geom_boxplot(outlier.shape = NA, width = 0.6) + # Add error bars
+          scale_fill_manual(values = c("#E69F00", "#56B4E9")) + # Custom colors
+          labs(y = 'Proportion',title = paste("Layer Proportions - ",celltype," in ",sex_var,sep = '')) +
+          facet_wrap(~ variable) + theme_minimal(base_size = 18) +  # Increase base font size
+    theme(
+        panel.border = element_rect(color = "black", fill = NA, size = 1),  # Add borders to facets
+        strip.background = element_rect(color = "black", fill = "gray", size = 1),  # Add border to facet titles
+        strip.text = element_text(size = 14),  # Adjust facet title text size
+        axis.ticks = element_line(color = "black"),  # Keep axis ticks
+        axis.text = element_text(size = 12),  # Increase axis text size
+        axis.title = element_text(size = 14),  # Increase axis title size
+        legend.title = element_text(size = 14),  # Increase legend title size
+        legend.text = element_text(size = 12)   # Increase legend text size
+    )
+    #print(p)
+    broad_plots[[paste(sex_var,
+                         celltype,sep = '_')]] <- p
+    
+    
+    broad_results[[paste(sex_var,celltype,sep = '_')]] <- sample_prop %>%
+    group_by(variable) %>%
+    summarise(
+        test_result = list(
+            tryCatch(
+                wilcox.test(value ~ Condition, exact = FALSE), 
+                error = function(e) NULL
+            )
+        ),
+        .groups = "drop"
+    ) %>%
+    dplyr::filter(!is.null(test_result)) %>%
+    mutate(
+        p_value = map_dbl(test_result, ~ .x$p.value),
+        statistic = map_dbl(test_result, ~ .x$statistic)
+    ) %>% as.data.frame()
+    broad_results[[paste(sex_var,
+                         celltype,sep = '_')]]$Class <- paste(sex_var,
+                                                                      celltype,sep = '_')
+  }
+}
+
+#broad_plots
+broad_results <- do.call('rbind',broad_results)
+broad_results$padj <- p.adjust(broad_results$p_value,method = 'BH')
+broad_plots[broad_results$Class[broad_results$p_value < 0.05]]
+```
+
+```{r}
+all_clust <- unique(mdd$Cluster[!str_detect(mdd$Cluster,'ExN')])
+all_clust <- all_clust[order(all_clust)]
+clust_plots <- list()
+for (sex_var in c('Male','Female')){
+  for (celltype in all_clust){
+    sample_prop <- table(mdd$Sample[mdd$Cluster == celltype & mdd$Sex == sex_var],
+                         mdd$Layer[mdd$Cluster == celltype & mdd$Sex == sex_var]) %>% 
+      as.matrix() 
+
+    sample_prop <- apply(sample_prop,1,function(a){a/sum(a)}) %>% t() %>%
+      as.data.frame()
+    
+    sample_prop$Condition <- mdd$Condition[match(rownames(sample_prop),mdd$Sample)]
+    sample_prop$Sex <- mdd$Sex[match(rownames(sample_prop),mdd$Sample)]
+    library(reshape2)
+    sample_prop <-  melt(sample_prop) %>%  
+      dplyr::filter(variable %in% layers)
+    
+    
+    # Compute summary statistics (mean and SD) for each group
+    summary_data <- sample_prop %>%
+        group_by(Condition, variable) %>%
+        summarise(
+            mean_value = mean(value),
+            sd_value = sd(value),
+            .groups = 'drop'
+        )
+    
+    # Plot with boxplots and error bars
+    p <-ggplot(sample_prop, aes(x = Condition, y = value, fill = Condition)) + 
+          geom_boxplot(outlier.shape = NA, width = 0.6) + # Add error bars
+          scale_fill_manual(values = c("#E69F00", "#56B4E9")) + # Custom colors
+          labs(y = 'Proportion',title = paste("Layer Proportions - ",celltype," in ",sex_var,sep = '')) +
+          facet_wrap(~ variable)
+    clust_plots[[length(clust_plots) + 1]] <- p
+    #print(p)
+    p<- ggplot(sample_prop, aes(x = Condition, y = value, fill = Condition)) + 
+          geom_violin() + # Violin plot
+          geom_jitter(width = 0.2, size = 1.5, alpha = 0.5) +
+          scale_fill_manual(values = c("#E69F00", "#56B4E9")) + # Custom colors
+          labs(y = 'Proportion',title = paste("Layer Proportions - ",celltype," in ",sex_var,sep = '')) +
+          facet_wrap(~ variable)
+    #print(p)
+  }
+}
+clust_plots
+```
+
+## RTM
+
+```{r}
+
+
+spe_train <- spe[,spe$sample_id == '151673']
+############### Hyper-params
+K <- 10
+max_iter <- 200
+lr <- 1e-5
+spe_train <- computeGeometricFactors(spe_train)
+spe_train <- logNormCounts(spe_train)
+dec <- modelGeneVar(spe_train)
+top_hvgs <- getTopHVGs(dec,n = 5000)
+spe_train <- spe_train[top_hvgs,]
+spe_train <- SpatialTopicExperiment(
+              spe_train,
+              guided = FALSE,
+              labels = NULL,
+              K,
+              hvg = NULL)
+nbr_list <- get_spots(spe_train,'sample_id','int_cell',NULL,dist = 3,loss_fun = 1)
+  
+weights <- train_RTM(counts(spe_train),
+            spe_train$int_cell,
+            rowData(spe_train)$gene_ints,
+            nbr_list,
+            alphaPrior(spe_train),
+            betaPrior(spe_train),
+            K,
+            ncol(spe_train),
+            ndk(spe_train),
+            nwk(spe_train),
+            6,
+            max_iter,
+            verbal = TRUE,
+            zero_gamma = FALSE,
+            rand_gamma = TRUE,
+            thresh = 0.00001,
+            lr =lr,
+            rho = 50000,
+            loss_fun = 1,
+            m_update = TRUE)
+  
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+ensembl_ids <- rownames(spe_train)
+
+# Get gene symbols for the given Ensembl IDs
+results <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),  # Define the information to retrieve
+  filters = "ensembl_gene_id",  # Define the filter (search by Ensembl ID)
+  values = ensembl_ids,  # Values to filter by (your list of Ensembl IDs)
+  mart = ensembl  # The connection object
+)
+
+# Display the results
+#print(results)
+spe_train <- buildPhi(spe_train)
+temp <- phi(spe_train)
+temp <- temp[results$ensembl_gene_id,]
+table(results$ensembl_gene_id == rownames(temp))
+rownames(temp) <- results$hgnc_symbol
+phi(spe_train) <- temp
+
+rtm_phi <- phi(spe_train)
+
+
+minmax_norm <- function(adj_mat){
+  min_val <- min(adj_mat)
+  max_val <- max(adj_mat)
+  adj_norm <- (adj_mat - min_val) / (max_val - min_val)
+  return(adj_norm)
+}
+```
+
+```{r}
+mdd <- readRDS("../data/mdd_sce_full.rds")
+K <- ncol(rtm_phi)
+keep.genes <- intersect(rownames(rtm_phi),rownames(mdd))
+rtm_phi <- rtm_phi[keep.genes,]
+
+mdd <- mdd[keep.genes,]
+gc()
+if (any(rownames(rtm_phi) != rownames(mdd))){stop("Mismatch!!")}
+
+mdd <- mdd[,mdd_barcode]
+mdd$Layer <- stm_mdd$Layer
+keep.samples <- 'F10'#c('F33','F38','F10','F26') #unique(mdd$Sample[mdd$Sex == 'Female'])
+mdd <- mdd[,mdd$Sample %in% keep.samples]
+gc()
+mdd <- SingleCellTopicExperiment(mdd,
+                              K = K)
+mdd <- scGTMPredict(mdd,6,maxiter = 150,verbal = T, phi = rtm_phi)
+
+mdd <- buildTheta(mdd)
+mdd$Broad <- factor(mdd$Broad,
+                    levels = c("ExN","InN","Ast","End","Mic","Mix","OPC","Oli"))
+for (cur_id in keep.samples){
+  cur_idx <- which(mdd$Sample == cur_id)
+
+  adj_mat <- nbr_pred(theta(mdd)[cur_idx,],
+                      weights = weights,
+                      max_val = 1,
+                      loss_fun = 1)
+  #adj_mat <- minmax_norm(adj_mat)
+  library(ComplexHeatmap)
+  library(circlize)
+  
+  
+  annotation_col = data.frame(
+                      Layer = mdd$Layer[cur_idx][order(mdd$Layer[cur_idx])]
+                  )
+  rownames(annotation_col) = rownames(adj_mat)[order(mdd$Layer[cur_idx])]
+  
+  annotation_row = data.frame(
+                    Layer = mdd$Layer[cur_idx][order(mdd$Layer[cur_idx])]
+                  )
+  rownames(annotation_row) = rownames(adj_mat)[order(mdd$Layer[cur_idx])]
+  
+  mycolors <- c("#b2df8a", "#e41a1c", "#377eb8", "#4daf4a", "#ff7f00", "gold", "#a65628")
+  names(mycolors) <- c('L1','L2','L3','L4','L5','L6','WM')
+  mycolors <- list(Layer = mycolors)
+  white_red_palette <- colorRampPalette(c("white", "red"))(50)
+  print( pheatmap(adj_mat[order(mdd$Layer[cur_idx]),order(mdd$Layer[cur_idx])],
+           color = white_red_palette,
+           cluster_rows = F,
+           cluster_cols = F,
+           annotation_col = annotation_col,
+           annotation_row = annotation_row,
+           annotation_colors = mycolors,
+           cellwidth = 0.16,
+           cellheight = 0.16))
+  
+  
+  annotation_col = data.frame(
+                      Broad = mdd$Broad[cur_idx][order(mdd$Broad[cur_idx])]
+                  )
+  rownames(annotation_col) = rownames(adj_mat)[order(mdd$Broad[cur_idx])]
+  
+  annotation_row = data.frame(
+                    Broad = mdd$Broad[cur_idx][order(mdd$Broad[cur_idx])]
+                  )
+  rownames(annotation_row) = rownames(adj_mat)[order(mdd$Broad[cur_idx])]
+  
+  mycolors <- c(
+  "#88CCEE", # Light Blue
+  "#DDCC77", # Light Brown
+  "#CC6677", # Soft Pink
+  "#44B3C2", # Softer Teal
+  "#FAA275", # Soft Orange (replacing soft peach)
+  "#AA99CC", # Soft Lavender
+  "#77DD77", # Soft Turquoise
+  "#A0A083"  # Muted Gray-Green 
+)
+  names(mycolors) <- levels(mdd$Broad)
+  mycolors <- list(Broad = mycolors)
+  white_red_palette <- colorRampPalette(c("white", "red"))(50)
+  print( pheatmap(adj_mat[order(mdd$Broad[cur_idx]),order(mdd$Broad[cur_idx])],
+           color = white_red_palette,
+           cluster_rows = F,
+           cluster_cols = F,
+           annotation_col = annotation_col,
+           annotation_row = annotation_row,
+           annotation_colors = mycolors,
+           cellwidth = 0.16,
+           cellheight = 0.16))
+}
+```
+
+```{r}
+for (cur_id in keep.samples){
+  cur_idx <- which(mdd$Sample == cur_id)
+
+  adj_mat <- nbr_pred(theta(mdd)[cur_idx,],
+                      weights = weights,
+                      max_val = 1,
+                      loss_fun = 1)
+  #adj_mat <- minmax_norm(adj_mat)
+  library(ComplexHeatmap)
+  library(circlize)
+  
+  
+  annotation_col = data.frame(
+                      Layer = mdd$Layer[cur_idx][order(mdd$Layer[cur_idx],mdd$Broad[cur_idx])],
+                      Broad = mdd$Broad[cur_idx][order(mdd$Layer[cur_idx],mdd$Broad[cur_idx])]
+                  )
+  rownames(annotation_col) = rownames(adj_mat)[order(mdd$Layer[cur_idx],mdd$Broad[cur_idx])]
+  
+  annotation_row = data.frame(
+                    Layer = mdd$Layer[cur_idx][order(mdd$Layer[cur_idx],mdd$Broad[cur_idx])],
+                    Broad = mdd$Broad[cur_idx][order(mdd$Layer[cur_idx],mdd$Broad[cur_idx])]
+                  )
+  rownames(annotation_row) = rownames(adj_mat)[order(mdd$Layer[cur_idx],mdd$Broad[cur_idx])]
+  
+  
+  mycolors <- c(
+  "#88CCEE", # Light Blue
+  "#DDCC77", # Light Brown
+  "#CC6677", # Soft Pink
+  "#44B3C2", # Softer Teal
+  "#FAA275", # Soft Orange (replacing soft peach)
+  "#AA99CC", # Soft Lavender
+  "#77DD77", # Soft Turquoise
+  "#A0A083"  # Muted Gray-Green 
+)
+  names(mycolors) <- levels(mdd$Broad)
+  #mycolors <- list(Broad = mycolors)
+  
+  mycolors1 <- c("#b2df8a", "#e41a1c", "#377eb8", "#4daf4a", "#ff7f00", "gold", "#a65628")
+  names(mycolors1) <- c('L1','L2','L3','L4','L5','L6','WM')
+  mycolors <- list(Layer = mycolors1,
+                   Broad = mycolors1)
+  
+  
+  white_red_palette <- colorRampPalette(c("white", "red"))(50)
+  print( pheatmap(adj_mat[order(mdd$Layer[cur_idx],mdd$Broad[cur_idx]),
+                          order(mdd$Layer[cur_idx],mdd$Broad[cur_idx])],
+           color = white_red_palette,
+           cluster_rows = F,
+           cluster_cols = F,
+           annotation_col = annotation_col,
+           annotation_row = annotation_row,
+           annotation_colors = mycolors,
+           cellwidth = 0.16,
+           cellheight = 0.16))
+}
+```
+
+## Check SpaTM-S programs
+
+```{r}
+viz_phi <- stm_phi
+#viz_phi <- t(apply(viz_phi,1,function(a){a/sum(a)}))
+top10_k <- as.vector(sapply(1:ncol(viz_phi),function(K){
+  top_10 <- order(viz_phi[,K],decreasing = T)[1:10]
+  viz_phi[top_10,] <- 0
+  top_10
+}))
+
+viz_phi <- stm_phi[unique(top10_k),]
+
+
+
+sig_genes <- readRDS("../data/DLPFC_markers.rds")
+#temp <- sig_genes[order(sig_genes$gene),c('test','gene','stat')]
+
+gene_labels <- c()
+second_labels <- c()
+for (gene in rownames(viz_phi)){
+  temp <- sig_genes[sig_genes$gene == gene,]
+  if (nrow(temp) == 1){
+    gene_labels <- c(gene_labels,temp$test)
+    second_labels <- c(second_labels,NA)
+  }
+  else if (nrow(temp) > 1){
+    gene_labels <- c(gene_labels,temp$test[which.max(temp$stat)])
+    second_labels <- c(second_labels,temp$test[order(temp$stat)][1])
+    print(temp)
+    print(temp$test[order(temp$stat)])
+  } else {
+    gene_labels <- c(gene_labels,NA)
+    second_labels <- c(second_labels,NA)
+  }
+}
+
+
+# Row annotations
+row_annotations <- data.frame(
+  Marker.1 = gene_labels,
+  Marker.2 = second_labels
+)
+rownames(row_annotations) <- rownames(viz_phi)
+
+# Define custom colors
+annotation_colors <- list(
+  Marker.1 = c('Layer1' = "#b2df8a",
+               'Layer2' = "#e41a1c",
+               'Layer3' = "#377eb8",
+               'Layer4' = "#4daf4a",
+               'Layer5' = "#ff7f00",
+               'Layer6' = "gold",
+               'WM' = "#a65628"),
+    Marker.2 = c('Layer1' = "#b2df8a",
+               'Layer2' = "#e41a1c",
+               'Layer3' = "#377eb8",
+               'Layer4' = "#4daf4a",
+               'Layer5' = "#ff7f00",
+               'Layer6' = "gold",
+               'WM' = "#a65628")
+)
+
+col_scale <- colorRamp2(c(min(viz_phi), min(0.05,max(viz_phi))), c("white", "red"))
+#col_scale <- colorRamp2(c(min(viz_phi), max(viz_phi)), c("white", "red"))
+viz_phi[viz_phi > 0.05] <- 0.05
+pheatmap(viz_phi,cluster_cols = F,
+         cluster_rows = F,color = col_scale,
+         heatmap_legend_param = list(
+             title = "Topic Weights",
+             at = c(round(min(viz_phi,0)),
+                    max(viz_phi))),
+         annotation_row = row_annotations,
+         annotation_colors = annotation_colors,
+         cellwidth = 15, fontsize_row = 8)  
+```
+
+## Topic Pathways
+
+```{r}
+mdd_theta <-  as.data.frame(mdd_theta)
+table(rownames(mdd_theta) == rownames(stm_mdd))
+
+mdd_theta$Sex <- stm_mdd$Sex
+mdd_theta$Layer <- stm_mdd$Layer
+mdd_theta$Broad <- stm_mdd$Broad
+mdd_theta$LayerProb <- layer_prob[,2]
+mdd_theta$Condition <- stm_mdd$Condition
+mdd_theta %>%
+  filter(Sex == 'Male',Broad == 'Mic',Layer == 'L2') %>%
+  ggplot(aes(Condition,y = `Topic-2`,fill = Condition)) +
+   geom_boxplot() + theme_minimal(base_size = 18) +  # Increase base font size
+    theme(panel.border = element_rect(color = "black", fill = NA, size = 1),  
+        strip.background = element_rect(color = "black", fill = "gray", size = 1), 
+        strip.text = element_text(size = 14),  # Adjust facet title text size
+        axis.ticks = element_line(color = "black"),  # Keep axis ticks
+        axis.text = element_text(size = 12),  # Increase axis text size
+        axis.title = element_text(size = 14),  # Increase axis title size
+        legend.title = element_text(size = 14),  # Increase legend title size
+        legend.text = element_text(size = 12)) + # Add error bars
+          scale_fill_manual(values = c("#E69F00", "#56B4E9"))
+  
+
+
+```

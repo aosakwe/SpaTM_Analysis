@@ -1,0 +1,233 @@
+---
+title: "SpaTM Figure 3"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+```{r,message=FALSE,warning=FALSE}
+set.seed(1234) 
+library(SpaTM)
+library(scran)
+library(scater) 
+library(tidyverse)   
+library(Matrix) 
+library(ComplexHeatmap) 
+library(circlize) 
+library(spatialLIBD) 
+library(patchwork) 
+library(tictoc)
+library(torch)
+```
+
+```{r}
+spe <- readRDS("../data/spe.rds")
+samples <- c("151673","151674","151675","151676","151507")
+spe <- spe[,spe$sample_id %in% samples]
+spe <- spe[,spe$spatialLIBD != 'Unknown']
+spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
+
+stm_obj <-  readRDS("../Final_Figures/Fig2/spe_obj.rds")
+
+spe_train <- stm_obj[[2]][[1]]
+
+spe <- spe[rownames(spe_train),]
+table(rownames(spe) == rownames(spe_train))
+```
+
+```{r}
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+ensembl_ids <- rownames(spe)
+
+# Get gene symbols for the given Ensembl IDs
+results <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),  # Define the information to retrieve
+  filters = "ensembl_gene_id",  # Define the filter (search by Ensembl ID)
+  values = ensembl_ids,  # Values to filter by (your list of Ensembl IDs)
+  mart = ensembl  # The connection object
+)
+
+phi(spe_train) <- phi(spe_train)[results$ensembl_gene_id,]
+spe <- spe[results$ensembl_gene_id,]
+spe_train <- spe_train[results$ensembl_gene_id,]
+table(results$ensembl_gene_id == rownames(phi(spe_train)))
+table(results$ensembl_gene_id == rownames(spe_train))
+table(results$ensembl_gene_id == rownames(spe))
+rownames(phi(spe_train)) <- results$hgnc_symbol
+rownames(spe_train)  <- results$hgnc_symbol
+rownames(spe)  <- results$hgnc_symbol
+stm_phi <- phi(spe_train)
+```
+
+## Infer Topic Mixtures
+
+```{r}
+spe_test <- spe[,spe$sample_id %in% c("151676","151507")]
+spe_test <- SpatialTopicExperiment(spe_test,
+                                   guided = F,
+                                   labels = NULL,
+                                   K = ncol(stm_phi))
+
+spe_test <- scGTMPredict(spe_test,
+                         num_threads = 4,
+                         maxiter = 150,
+                         verbal = T,
+                         phi = stm_phi)
+spe_test <- buildTheta(spe_test)
+```
+
+```{r}
+stm_gex <- stm_phi %*% t(theta(spe_test))
+stm_gex <- apply(stm_gex,2,function(a){a/sum(a)})
+
+dim(spe_test)
+dim(stm_gex)
+spe_test$TotalCount <- colSums(counts(spe_test))
+```
+
+```{r,warning=FALSE}
+
+assay(spe_test,'stm_gex') <- sweep(stm_gex, 2, spe_test$TotalCount, `*`)
+
+
+spe676 <- spe_test[,spe_test$sample_id == '151676']
+#spe676 <- computeMedianFactors(spe676,assay.type = 'stm_gex')
+spe676 <- logNormCounts(spe676,
+                        name = 'stm_lognorm',
+                        assay.type = 'stm_gex',
+                        size.factors = NULL)
+
+dist676 <- get_dist_cpp(as.matrix(colData(spe676)[,c('array_row','array_col')]))
+dist676 <- 1/dist676
+diag(dist676) <- 0
+####
+spe507 <- spe_test[,spe_test$sample_id == '151507']
+#spe507 <- computeMedianFactors(spe507,assay.type = 'stm_gex')
+spe507 <- logNormCounts(spe507,
+                        name = 'stm_lognorm',
+                        assay.type = 'stm_gex',
+                        size.factors = NULL)
+
+dist507 <- get_dist_cpp(as.matrix(colData(spe507)[,c('array_row','array_col')]))
+dist507 <- 1/dist507
+diag(dist507) <- 0
+```
+
+```{r}
+library(ape)
+dlpfc_markers <- readRDS("../data/DLPFC_markers.rds")
+dlpfc_markers <- intersect(rownames(spe_test),dlpfc_markers$gene)
+all_res676 <- list()
+for (cur_gene in dlpfc_markers){
+  spe_test$Recon <- stm_gex[cur_gene,]
+  val <- c(
+  Moran.I(logcounts(spe676)[cur_gene,],dist676)$observe,
+  Moran.I(assay(spe676,"stm_lognorm")[cur_gene,],dist676)$observed)
+  all_res676[[cur_gene]] <- val
+}
+
+all_res507 <- list()
+for (cur_gene in dlpfc_markers){
+  spe_test$Recon <- stm_gex[cur_gene,]
+  val <- c(
+  Moran.I(logcounts(spe507)[cur_gene,],dist507)$observe,
+  Moran.I(assay(spe507,"stm_lognorm")[cur_gene,],dist507)$observed)
+  all_res507[[cur_gene]] <- val
+}
+all_res676 <- do.call('rbind',all_res676) %>%
+  as.data.frame()
+colnames(all_res676) <- c('Uncorrected','SpaTM-S')
+all_res507 <- do.call('rbind',all_res507) %>%
+  as.data.frame()
+colnames(all_res507) <- c('Uncorrected','SpaTM-S')
+boxplot(all_res676)
+boxplot(all_res507)
+```
+
+```{r}
+library(reshape2)
+all_res676 <- melt(all_res676)
+all_res507 <- melt(all_res507)
+
+
+all_res676 %>% 
+  ggplot(aes(variable,value,fill = variable)) +
+  geom_boxplot() +  
+    labs(title = 'Slide 151676',x = "", y = "Moran's I") +
+    theme_minimal(base_size = 18) + 
+    theme(
+        plot.title = element_text(hjust = 0.5),
+        axis.line = element_line(color = "black",size = 1),
+        panel.border = element_blank(), 
+        axis.ticks = element_line(color = "black"),
+        axis.text = element_text(size = 16), 
+        axis.title = element_text(size = 20), 
+        legend.position = 'none')
+    
+
+
+all_res507 %>% 
+  ggplot(aes(variable,value,fill = variable)) +
+  geom_boxplot() +  
+    labs(title = 'Slide 151507',x = "", y = "Moran's I") +
+    theme_minimal(base_size = 18) + 
+    theme(
+        plot.title = element_text(hjust = 0.5),
+        axis.line = element_line(color = "black",size = 1),
+        panel.border = element_blank(), 
+        axis.ticks = element_line(color = "black"),
+        axis.text = element_text(size = 16), 
+        axis.title = element_text(size = 20), 
+        legend.position = 'none')
+
+```
+
+```{r}
+cur_gene <- 'ENC1'
+
+#Within
+p1 <- list(vis_clus(spe_test,'151676',clustervar = 'spatialLIBD') +
+  theme(legend.position = 'none'),
+vis_gene(spe_test,'151676',geneid = cur_gene,minCount = -1e-10) +
+  theme(legend.position = 'none'),
+vis_gene(spe676,'151676',geneid = cur_gene,assayname = "stm_lognorm",minCount = -1e-10) +
+  theme(legend.position = 'none'))
+#Cross
+p2 <- list(vis_clus(spe_test,'151507',clustervar = 'spatialLIBD') + 
+  theme(legend.position = 'none'),
+vis_gene(spe_test,'151507',geneid = cur_gene,minCount = -1e-10) + 
+  theme(legend.position = 'none'),
+vis_gene(spe507,'151507',geneid = cur_gene,assayname = "stm_lognorm",minCount = -1e-10) + 
+  theme(legend.position = 'none'))
+library(patchwork)
+
+```
+
+```{r}
+cur_gene <- 'SYT1'
+
+#Within
+p3 <- list(vis_clus(spe_test,'151676',clustervar = 'spatialLIBD') +
+  theme(legend.position = 'none'),
+vis_gene(spe_test,'151676',geneid = cur_gene,minCount = -1e-10) +
+  theme(legend.position = 'none'),
+vis_gene(spe676,'151676',geneid = cur_gene,assayname = "stm_lognorm",minCount = -1e-10) +
+  theme(legend.position = 'none'))
+#Cross
+p4 <- list(vis_clus(spe_test,'151507',clustervar = 'spatialLIBD') + 
+  theme(legend.position = 'none'),
+vis_gene(spe_test,'151507',geneid = cur_gene,minCount = -1e-10) + 
+  theme(legend.position = 'none'),
+vis_gene(spe507,'151507',geneid = cur_gene,assayname = "stm_lognorm",minCount = -1e-10) + 
+  theme(legend.position = 'none'))
+
+
+```
+
+```{r}
+wrap_plots(p1)
+wrap_plots(p2)
+wrap_plots(p3)
+wrap_plots(p4)
+```

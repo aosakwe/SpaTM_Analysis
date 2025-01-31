@@ -1,0 +1,159 @@
+---
+title: "SpaTM_Figure4CD"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+```{r,echo =FALSE,message=FALSE,warning=FALSE}
+set.seed(1234) 
+library(SpaTM)
+library(scran)
+library(scater) 
+library(tidyverse)   
+library(Matrix) 
+library(spatialLIBD)
+library(torch)
+library(DescTools)
+library(mclust)
+spe <- readRDS("../data/spe.rds")
+
+
+spe <- spe[,spe$spatialLIBD != 'Unknown' & spe$sample_id == '151673']
+spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
+
+```
+
+```{r,messages = FALSE,warning=FALSE,echo = FALSE}
+##Remove Mitochondrial genes
+library(EnsDb.Hsapiens.v75)
+gns <- genes(EnsDb.Hsapiens.v75, filter = ~ seq_name == "MT")
+spe <- spe[!rownames(spe) %in% gns$gene_id,]
+## Remove Ribosomal Proteins
+cur_genes <- genes(EnsDb.Hsapiens.v75)$symbol
+cur_genes <- cur_genes[grepl(pattern = "^RP[SL][[:digit:]]|^RP[[:digit:]]|^RPSA",cur_genes)]
+genes_remove <- genes(EnsDb.Hsapiens.v75, filter = ~ symbol %in% cur_genes)$gene_id
+spe <- spe[!rownames(spe) %in% genes_remove,]
+
+K <- 8
+spe <- SpatialTopicExperiment(spe,K = K)
+
+```
+
+```{r}
+max_iter <- 200
+lr <- 0.00001
+K <- 8
+n_genes <- 3000
+nbr_dist <- 3
+spe_train <- spe
+spe_train$spatialLIBD <- as.factor(as.character(spe_train$spatialLIBD))
+
+##Get Top genes
+spe_train <- computeGeometricFactors(spe_train)
+spe_train <- logNormCounts(spe_train)
+dec <- modelGeneVar(spe_train)
+top_hvgs <- getTopHVGs(dec,n = n_genes)
+spe_train <- spe_train[top_hvgs,]
+
+#Remove cells & genes with no counts
+spe_train <- spe_train[,colSums(counts(spe_train)) > 0]
+spe_train <- spe_train[rowSums(counts(spe_train)) >0,]
+top_hvgs <- rownames(spe_train)
+
+spe_train <- SpatialTopicExperiment(
+  spe_train,
+  guided = FALSE,
+  labels = NULL,
+  K,
+  hvg = NULL)
+
+
+##Define Neighbors
+nbr_list <- get_spots(spe_train,'sample_id','int_cell',NULL,dist = nbr_dist,loss_fun = 1)
+
+
+#Train
+D <- ncol(spe_train)
+
+
+
+
+####Run RTM######
+rtm_weights <- train_RTM(counts(spe_train),
+          spe_train$int_cell,
+          rowData(spe_train)$gene_ints,
+          nbr_list,
+          alphaPrior(spe_train),
+          betaPrior(spe_train),
+          K,
+          ncol(spe_train),
+          ndk(spe_train),
+          nwk(spe_train),
+          6,
+          max_iter,
+          verbal = TRUE,
+          zero_gamma = FALSE,
+          rand_gamma = TRUE,#FALSE,
+          thresh = 0.00001,
+          lr =lr,
+          rho = 50000,
+          loss_fun = 1,
+          m_update = TRUE)
+
+spe_train <- buildTheta(spe_train)
+spe_train <- buildPhi(spe_train)
+
+
+
+##Start
+spe_test <- spe
+spe_test$spatialLIBD <- as.factor(as.character(spe_test$spatialLIBD))
+####Top HVGs ####
+spe_test <- spe_test[top_hvgs,]
+######
+
+spe_test <- SpatialTopicExperiment(
+  spe_test,
+  guided = FALSE,
+  labels = NULL,
+  K,
+  hvg = NULL)
+
+spe_test <- scGTMPredict(spe_test,1,100,FALSE,phi(spe_train))
+spe_test <- buildTheta(spe_test)
+
+
+
+##Build Adjacency Matrices 
+reducedDim(spe_test,'ADJ') <- get_all_pred(spe_test,
+                         rtm_weights,loss_fun = 1)
+num_clusts <- length(unique(spe_test$spatialLIBD))
+spe_test <- runPCA(spe_test,dimred = 'ADJ')
+
+### Generate Clusters
+clust_input <- 'PCA'
+library(bluster)
+lei_clust <-  clust_optim(spe_test,num_clusts,100,X = clust_input, k = 10,alg = 'leiden')
+
+spe_test$leiden <- lei_clust$clustering
+
+spe_test$leiden <- lei_clust$clustering %>% as.character()
+
+spe_test$smooth <- rtm_smooth(spe_test,spe_test$leiden,nbr_list = nbr_list) 
+
+```
+
+## Panel C
+
+```{r}
+vis_clus(spe_test,clustervar = 'smooth',
+         colors = c("#6dc39e",
+                 "#8c9fc8",
+                 "#e68ac0",
+                 "#a6c381",
+                  "#f7c73d",
+                 "#e0bb96",
+                 "#fa8d5f",
+                 "#d9534f"))
+```
