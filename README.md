@@ -4,9 +4,9 @@ This repository contains the analysis code used to produce the results in our re
 
 The SpaTM R package is stored in a separate repository and [can be found here](https://github.com/li-lab-mcgill/SpaTM/tree/main).
 
-**IMPORTANT** The scripts were run using version 0.2 of ```SpaTM```. Thus, to run these scripts, you must use the corresponding version stored within a separate branch [(archive/v0.2)](https://github.com/li-lab-mcgill/SpaTM/tree/archive/v0.2). To install the specified branch, you can run the following:
+**IMPORTANT** The scripts were run using version 0.3 of ```SpaTM```. Thus, to run these scripts, you must use the corresponding version stored within a separate branch [(archive/v0.3)](https://github.com/li-lab-mcgill/SpaTM/tree/archive/v0.3). To install the specified branch, you can run the following:
 ```
-devtools::install_github("li-lab-mcgill/SpaTM", ref = "archive/v0.2")
+devtools::install_github("li-lab-mcgill/SpaTM", ref = "archive/v0.3")
 ```
 
 ## Datasets used
