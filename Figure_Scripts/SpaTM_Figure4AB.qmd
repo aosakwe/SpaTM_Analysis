@@ -240,10 +240,10 @@ for(i in 1:length(scenarios)){
 
   ## Build Inputs
   train_copy <- spe_train
-  train_copy <- scGTM(train_copy,K,D,6,250,FALSE,FALSE,TRUE)
+  train_copy <- GTM(train_copy,K,D,6,250,FALSE,FALSE,TRUE)
   
   train_copy <- buildPhi(train_copy)
-  train_copy <- scGTMPredict(train_copy,6,100,FALSE,phi(train_copy))
+  train_copy <- inferTopics(train_copy,6,100,FALSE,phi(train_copy))
   train_copy <- buildTheta(train_copy)
   train_inputs <- create_inputs(train_copy,nbr_list)
   names(train_inputs) <- c('x','y')
@@ -257,32 +257,32 @@ for(i in 1:length(scenarios)){
  
   
   ####Run RTM######
-  rtm_weights <- train_RTM(counts(spe_train),
-                          spe_train$int_cell,
-                          rowData(spe_train)$gene_ints,
-                          nbr_list,
-                          alphaPrior(spe_train),
-                          betaPrior(spe_train),
-                          K,
-                          ncol(spe_train),
-                          ndk(spe_train),
-                          nwk(spe_train),
-                          6,
-                          max_iter,
-                          verbal = TRUE,
-                          zero_gamma = FALSE,
-                          rand_gamma = TRUE,
-                          thresh = 0.00001,
-                          lr =lr,
-                          rho = 50000,
-                          loss_fun = 1,
-                          m_update = TRUE)
-  
+  rtm_weights <- SpaTM:::train_RTM(counts(spe_train),
+                            spe_train$int_cell,
+                            rowData(spe_train)$gene_ints,
+                            nbr_list,
+                            alphaPrior(spe_train),
+                            betaPrior(spe_train),
+                            K,
+                            ncol(spe_train),
+                            ndk(spe_train),
+                            nwk(spe_train),
+                            6,
+                            max_iter,
+                            verbal = TRUE,
+                            zero_gamma = FALSE,
+                            rand_gamma = TRUE,
+                            thresh = 0.00001,
+                            lr =lr,
+                            rho = 50000,
+                            loss_fun = 1,
+                            m_update = TRUE)
+    
   ################## Predictions 
   spe_train <- buildTheta(spe_train)
   spe_train <- buildPhi(spe_train)
   
-  spe_train <- scGTMPredict(spe_train,1,150,FALSE,phi(spe_train))
+  spe_train <- inferTopics(spe_train,1,150,FALSE,phi(spe_train))
   spe_train <- buildTheta(spe_train)
   
   
@@ -319,11 +319,11 @@ for(i in 1:length(scenarios)){
                           NULL,dist = 3,
                           loss_fun = 1)
   
-    spe_test <- scGTMPredict(spe_test,1,150,FALSE,phi(spe_train))
+    spe_test <- inferTopics(spe_test,1,150,FALSE,phi(spe_train))
     spe_test <- buildTheta(spe_test)
     
     
-    spe_test2 <- scGTMPredict(spe_test2,1,150,FALSE,phi(train_copy))
+    spe_test2 <- inferTopics(spe_test2,1,150,FALSE,phi(train_copy))
     spe_test2 <- buildTheta(spe_test2)
     ##Build Adjacency Matrices TODO
     adj_list <- get_all_pred(spe_test,

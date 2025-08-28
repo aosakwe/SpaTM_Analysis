@@ -23,7 +23,7 @@ library(torch)
 ```{r}
 # Load Data
 spe <- readRDS("../data/spe.rds")
-samples <- c("151673","151674")
+samples <- c("151673","151674","151675","151676")
 spe <- spe[,spe$sample_id %in% samples]
 spe <- spe[,spe$spatialLIBD != 'Unknown']
 spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
@@ -97,14 +97,31 @@ D <- ncol(spe_train)
 ###
 
 #Burn-in STM
-STM_burnin(spe_train,1,5,FALSE,TRUE,FALSE,1e-05,1e-08,mlp,mlp_layers,mlp_epoch = 10,elbo_mat,spe_val) 
-mlp <- STM(spe_train,1,max_iter,FALSE,TRUE,FALSE,1e-05,1e-03,mlp,mlp_layers,mlp_epoch = 500,elbo_mat,spe_val)
+#STM_burnin(spe_train,1,5,FALSE,TRUE,FALSE,1e-05,1e-08,mlp,mlp_layers,mlp_epoch = 10,elbo_mat,spe_val) 
+#mlp <- STM(spe_train,1,max_iter,FALSE,TRUE,FALSE,1e-05,1e-03,mlp,mlp_layers,mlp_epoch = 500,elbo_mat,spe_val)
 ####
+spe_train <- STM(spe_train,
+                   'layer',
+                   1,
+                   max_iter,
+                   TRUE,
+                   TRUE,
+                   FALSE,
+                   thresh = 1e-10,
+                   lr = 1e-05,
+                   mlp = mlp,
+                   mlp_layers = mlp_layers,
+                   mlp_epoch = 500,
+                   spe_val = spe_val,
+                   balanced_class = FALSE)
+mlp <- metadata(spe_train)[['STM_MLP']]
+
 spe_train <- buildTheta(spe_train)
 spe_train <- buildPhi(spe_train)
 
 
-spe_train <- scGTMPredict(spe_train,1,100,FALSE,phi(spe_train))
+#spe_train <- scGTMPredict(spe_train,1,100,FALSE,phi(spe_train))
+spe_train <- inferTopics(spe_train,6,100,T,phi(spe_train))
 spe_train <- buildTheta(spe_train)
 
 
@@ -222,16 +239,40 @@ ribosomal_genes <- getBM(
 ```
 
 ```{r}
-n_gene <- 2500
+#n_gene <- 5000
 
 #for (n_gene in c(1000,2500,5000,10000,15000)){
   mdd <- readRDS("../data/mdd_sce_full.rds")
-  mdd <- mdd[,mdd$DF.classifications == 'Singlet' & mdd$Condition != 'Case' & mdd$Broad != 'Mix' & mdd$Sex == 'Female']
-  rm.genes <- c(mt_genes$hgnc_symbol,ribosomal_genes$hgnc_symbol)
-  mdd <- mdd[!rownames(mdd) %in% rm.genes,]
-  mdd <- SingleCellTopicExperiment(mdd,T,'Broad',hvg = n_gene)
+  mdd <- mdd[,mdd$DF.classifications == 'Singlet' & mdd$Condition != 'Case' & mdd$Broad != 'Mix']
+  #rm.genes <- c(mt_genes$hgnc_symbol,ribosomal_genes$hgnc_symbol)
+  #mdd <- mdd[!rownames(mdd) %in% rm.genes,]
+  count_prop <- tabulate(counts(mdd)@i +1)/ncol(mdd)
+
+  mdd <- mdd[rownames(mdd)[count_prop > 0.02 & count_prop < 0.75],]
+
+  #keep.genes <- intersect(rownames(mdd),rownames(se))
+  #mdd <- mdd[keep.genes,]
+  
+  celltypes <- unique(mdd$Broad)
+
+  mdd$keep <- FALSE
+  for (cell in celltypes){
+    idx <- which(mdd$Broad == cell)
+    prob.keep <- 1000/length(idx)
+    mdd$keep[idx] <-  sample(c(T,F),length(idx),prob = c(prob.keep,1-prob.keep),replace = T)
+    
+  }
+  mdd <- mdd[,mdd$keep]
+  mdd <- SingleCellTopicExperiment(mdd,T,'Broad')#,hvg = n_gene)
+  alphaPrior(mdd)[alphaPrior(mdd) == 0.01] <- 0
+  cell_prop <- as.matrix(table(mdd$Broad))/ncol(mdd)
+  cell_prop <- cell_prop[colnames(theta(mdd)),]
+  cell_prop <- 1/cell_prop
+  alphaPrior(mdd) <- sweep(alphaPrior(mdd), 2, cell_prop, "*")
+  alphaPrior(mdd)[alphaPrior(mdd) == 0] <- 0.01
+
   gc()
-  mdd <- scGTM(mdd,K = ncol(alphaPrior(mdd)),D = ncol(mdd),num_threads = 6,maxiter = 100,verbal = F)
+  mdd <- GTM(mdd,K = ncol(alphaPrior(mdd)),D = ncol(mdd),num_threads = 6,maxiter = 150,verbal = F)
   mdd <- buildTheta(mdd)
   mdd <- buildPhi(mdd)
   colnames(phi(mdd)) <- colnames(alphaPrior(mdd))
@@ -240,7 +281,7 @@ n_gene <- 2500
   mdd$Pred <- colnames(alphaPrior(mdd))[mdd$Pred]
   mdd$Pred <- factor(mdd$Pred,levels = levels(mdd$Broad))
   #table(mdd$Broad,mdd$Pred)
-  print(n_gene)
+  #print(n_gene)
   print(sum(mdd$Pred == mdd$Broad)*100/ncol(mdd))
   print('====')
 #}
@@ -249,7 +290,7 @@ n_gene <- 2500
 
 ```{r}
 
-gtm_spe <- spe[,spe$sample_id == '151673']
+gtm_spe <- spe[,spe$sample_id == '151676']
 
 K <- ncol(theta(mdd))
 gtm_spe <- SpatialTopicExperiment(gtm_spe,K = K)
@@ -272,27 +313,28 @@ table(results$ensembl_gene_id == rownames(temp))
 rownames(temp) <- results$hgnc_symbol
 gtm_spe <- temp
 
-keep.genes <- intersect(rownames(gtm_spe),rownames(mdd))
+keep.genes <- intersect(rownames(gtm_spe),rownames(phi(mdd)))
 gtm_spe <- gtm_spe[keep.genes,]
 rm('temp')
 gc()
 
-mdd <- mdd[keep.genes,]
+#mdd <- mdd[keep.genes,]
 phi(mdd) <- phi(mdd)[keep.genes,]
 #phi(mdd) <- apply(phi(mdd),2,function(a){a/sum(a)})
 gc()
 if (any(rownames(gtm_spe) != rownames(phi(mdd)))){stop("Mismatch!!")}
 
 gtm_spe <- SpatialTopicExperiment(gtm_spe,K = K)
-gtm_spe <- scGTMPredict(gtm_spe,6,100,T,phi(mdd))
+gtm_spe <- inferTopics(gtm_spe,6,100,T,phi(mdd))
 gtm_spe <- buildTheta(gtm_spe)
 colnames(theta(gtm_spe)) <- colnames(theta(mdd))
-for (i in 1:ncol(theta(gtm_spe))){
+#for (i in 1:ncol(theta(gtm_spe))){
+  i <- 4
   gtm_spe$Topic <- theta(gtm_spe)[,i]
-  p <- vis_gene(gtm_spe,geneid = 'Topic') + 
+  p <- vis_gene(gtm_spe,geneid = 'Topic',sampleid = '151676') + 
     labs(title = colnames(phi(mdd))[i])
   print(p)
-}
+#}
 
 ```
 
@@ -432,14 +474,26 @@ p5 <- theta_spe %>%
 ```
 
 ```{r}
-vis_clus(rtm_spe,clustervar = 'leiden',
-         colors = c("#6dc39e",
+rtm_spe <- full_results[[2]][['151674']][[1]]
+rtm_spe <- SpatialExperiment(
+  assays = list(counts = counts(rtm_spe)),
+  colData = colData(rtm_spe),
+  spatialCoords = spatialCoords(rtm_spe),
+  imgData = imgData(rtm_spe)
+)
+vis_clus(rtm_spe,clustervar = 'smooth',
+         colors = c( "#f7c73d",
+           "#fa8d5f",
+                      
+                 
                  "#8c9fc8",
-                 "#e68ac0",
-                 "#a6c381",
-                  "#f7c73d",
+                  
+           "#a6c381",
+                 
+                  "#e68ac0",
+                 "#6dc39e",
+                
                  "#e0bb96",
-                 "#fa8d5f",
                  "#d9534f"))
 vis_clus(stm_spe,clustervar = 'Alt')
 gtm_spe$Topic <- theta(gtm_spe)[,'Oli']
@@ -449,4 +503,88 @@ p2
 p3
 p4
 p5
+```
+
+```{r}
+rtm_spe <- full_results[[2]][['151675']][[1]]
+rtm_spe <- SpatialExperiment(
+  assays = list(counts = counts(rtm_spe)),
+  colData = colData(rtm_spe),
+  spatialCoords = spatialCoords(rtm_spe),
+  imgData = imgData(rtm_spe)
+)
+vis_clus(rtm_spe,clustervar = 'smooth',
+         colors = c( "#f7c73d",
+          
+                      
+                 
+                 "#8c9fc8",
+                 "#6dc39e",
+           "#a6c381",
+                 
+                  "#e68ac0",
+             "#fa8d5f",
+                 
+                
+                 "#e0bb96",
+                 "#d9534f"))
+```
+
+```{r}
+rtm_spe <- full_results[[2]][['151676']][[1]]
+rtm_spe <- SpatialExperiment(
+  assays = list(counts = counts(rtm_spe)),
+  colData = colData(rtm_spe),
+  spatialCoords = spatialCoords(rtm_spe),
+  imgData = imgData(rtm_spe)
+)
+vis_clus(rtm_spe,clustervar = 'smooth',
+         colors = c(   "#6dc39e",
+                 
+           "#f7c73d",
+          
+                     
+                 "#8c9fc8",
+               
+        
+                 
+                  "#e68ac0",
+              "#e0bb96",
+             "#fa8d5f", 
+                  "#a6c381",
+                
+                
+                 "#d9534f"))
+```
+
+```{r}
+#rtm_spe <- full_results[[2]][['151674']][[1]]
+rtm_spe <- spe[,spe$sample_id == '151676']
+rtm_spe <- rtm_spe[,colnames(full_results[[2]][['151676']][[1]])]
+nbr_list <- full_results[[2]][['151676']][[2]]
+mlp <- torch_load("../Final_Figures/Fig2/scen1_torch.torch")
+stm_phi <- readRDS("../Final_Figures/Fig2/spe_obj.rds")
+stm_phi <- phi(stm_phi[[1]][[1]])
+
+keep.genes <- intersect(rownames(rtm_spe),rownames(stm_phi))
+rtm_spe <- rtm_spe[keep.genes,]
+stm_phi <- stm_phi[keep.genes,]
+
+rtm_spe <- SpatialTopicExperiment(rtm_spe,
+                                  K = ncol(stm_phi))
+rtm_spe <- inferTopics(rtm_spe,
+                       6,
+                       100,
+                       T,
+                       stm_phi)
+rtm_spe <- buildTheta(rtm_spe)
+rtm_spe$Label <- pred_mlp(mlp,theta(rtm_spe))
+rtm_spe$Label <- rtm_smooth(rtm_spe,rtm_spe$Label,nbr_list)
+rtm_spe <- SpatialExperiment(
+  assays = list(counts = counts(rtm_spe)),
+  colData = colData(rtm_spe),
+  spatialCoords = spatialCoords(rtm_spe),
+  imgData = imgData(rtm_spe)
+)
+vis_clus(rtm_spe,clustervar = 'Label')
 ```

@@ -23,15 +23,25 @@ library(torch)
 ```{r,echo=FALSE,message=FALSE}
 # Load Data
 spe <- readRDS("../data/spe.rds")
-samples <- c("151673","151674","151675","151676","151507")
-spe <- spe[,spe$sample_id %in% samples]
+#samples <- c("151673","151674","151675","151676","151507")
+#spe <- spe[,spe$sample_id %in% samples]
 spe <- spe[,spe$spatialLIBD != 'Unknown']
 spe$spatialLIBD <- as.factor(as.character(spe$spatialLIBD))
 
+# scenarios <- list(list(train = c("151673"),test = c('151676','151507','151508'  ,'151509',
+#                                 '151510',"151669",
+#                                 "151670",
+#                                 "151671",
+#                                 "151672")),
+#                   list(train = c("151673","151674","151675"),
+#                        test = c('151676','151507','151508','151509',
+#                                 '151510',"151669",
+#                                 "151670",
+#                                 "151671",
+#                                 "151672")))
 scenarios <- list(list(train = c("151673"),test = c('151676','151507')),
                   list(train = c("151673","151674","151675"),
                        test = c('151676','151507')))
-
 models <- list()
 ############### Number of Topics
 K <- 8
@@ -52,14 +62,15 @@ spe <- spe[!rownames(spe) %in% genes_remove,]
 # spe <- spe[top_hvgs,]
 spe$layer <- as.numeric(spe$spatialLIBD) - 1
 
-results <- matrix(0,nrow = 4,ncol = 2)
+results <- matrix(0,nrow = (length(scenarios[[1]]$test) + length(scenarios[[2]]$test)),ncol = 2)
 rownames(results) <- paste('Scenario ',1:nrow(results),sep = '')
 
 spe <- SpatialTopicExperiment(spe,K = K)
 max_iter <- 100
 
 z <- 1
-for(i in 1:length(scenarios)){
+n_gene <- 1000
+for(i in 1:2){#length(scenarios)){
 
   print(paste("Scenario: ",i,sep = ''))
   spe_train <- spe[,spe$sample_id %in% scenarios[[i]]$train]
@@ -75,7 +86,7 @@ for(i in 1:length(scenarios)){
     spe_train <- computeGeometricFactors(spe_train)
     spe_train <- logNormCounts(spe_train)
     dec <- modelGeneVar(spe_train)
-    top_hvgs <- getTopHVGs(dec,n = 1000)
+    top_hvgs <- getTopHVGs(dec,n = n_gene)
     spe_train <- spe_train[top_hvgs,]
     spe_val <- spe_val[top_hvgs,]
   } else {
@@ -86,7 +97,7 @@ for(i in 1:length(scenarios)){
     #Top HVGs ####
     spe_train <- logNormCounts(spe_train)
     dec <- modelGeneVar(spe_train)
-    top_hvgs <- getTopHVGs(dec,n = 1000)
+    top_hvgs <- getTopHVGs(dec,n = n_gene)
     spe_train <- spe_train[top_hvgs,]
     spe_val <- spe_val[top_hvgs,]
   }
@@ -110,18 +121,28 @@ for(i in 1:length(scenarios)){
       hvg = NULL)
   #Train
   D <- ncol(spe_train)
-  #spe_train <- scGTM(spe_train,K,D,1, maxiter =200, verbal = FALSE)
-  ###
 
-  #Burn-in STM
-  STM_burnin(spe_train,1,5,FALSE,TRUE,FALSE,1e-05,1e-08,mlp,mlp_layers,mlp_epoch = 10,spe_val)
-  mlp <- STM(spe_train,1,max_iter,FALSE,TRUE,FALSE,1e-05,1e-03,mlp,mlp_layers,mlp_epoch = 500,spe_val)
+  spe_train <- STM(spe_train,
+                   'layer',
+                   6,
+                   max_iter,
+                   TRUE,
+                   TRUE,
+                   FALSE,
+                   thresh = 1e-10,
+                   lr = 1e-03,
+                   mlp = mlp,
+                   mlp_layers = mlp_layers,
+                   mlp_epoch = 500,
+                   spe_val = spe_val,
+                   balanced_class = TRUE)
+  mlp <- metadata(spe_train)[['STM_MLP']]
   ####
   spe_train <- buildTheta(spe_train)
   spe_train <- buildPhi(spe_train)
 
 
-  spe_train <- scGTMPredict(spe_train,1,100,FALSE,phi(spe_train))
+  spe_train <-inferTopics(spe_train,1,100,FALSE,phi(spe_train))
   spe_train <- buildTheta(spe_train)
 
 
@@ -132,7 +153,7 @@ for(i in 1:length(scenarios)){
   print(paste("train Acc: ",train_acc, sep = ''))
 
   ###
-  spe_val <- scGTMPredict(spe_val,1,100,FALSE,phi(spe_train))
+  spe_val <- inferTopics(spe_val,1,100,FALSE,phi(spe_train))
   spe_val <- buildTheta(spe_val)
 
 
@@ -148,7 +169,7 @@ for(i in 1:length(scenarios)){
   models[[i]] <- list(spe_train,mlp)
   ############Predict Test###################
   
-  for(j in 1:2){
+  for(j in 1:length(scenarios[[i]]$test)){
     test_res <- c()
     spe_test <- spe[,spe$sample_id %in% scenarios[[i]]$test[j]]
     ####Top HVGs ####
@@ -161,7 +182,7 @@ for(i in 1:length(scenarios)){
       labels = NULL,
       K,
       hvg = NULL)
-    spe_test <- scGTMPredict(spe_test,1,100,FALSE,best_phi)
+    spe_test <- inferTopics(spe_test,1,100,FALSE,best_phi)
     spe_test <- buildTheta(spe_test)
     #Test Accuracy
 
@@ -169,7 +190,7 @@ for(i in 1:length(scenarios)){
     
     
     ### RTM-based Smoothing
-    nbr_list <- get_spots(spe_test,'sample_id','int_cell',NULL,dist = 3,loss_fun = 1)
+    nbr_list <- get_nbrs(spe_test,'sample_id','int_cell',NULL,dist = 3,loss_fun = 1)
     smooth_pred <- rtm_smooth(spe_test,test_pred,nbr_list = nbr_list)
     #smooth_pred <-  rtm_smooth(spe_test,test_pred,k = 5)
     #for (m in 1:10){
@@ -184,22 +205,24 @@ for(i in 1:length(scenarios)){
       100/ncol(spe_test)
     print(paste(scenarios[[i]]$test[j], " || Smooth Test Acc: ",test_acc, sep = ''))
     test_res <- c(test_res,test_acc)
-    #spe_test$Pred <- smooth_pred
+    spe_test$Pred <- test_pred
+    spe_test$smooth <- smooth_pred
     #vis_clus(spe_test,clustervar = 'Pred')
     #results[i,j+1] <- test_acc
     print('=============')
     results[z,] <- test_res
     z <- z + 1
-    #test_true <- as.numeric(spe_test$spatialLIBD)
-    # for (z in 1:max(test_true)){
-    #   cur_idx <- which(test_true == z)
-    #   print(levels(spe_test$spatialLIBD)[z])
-    #   print(length(which(test_pred[cur_idx] == test_true[cur_idx]))*100/length(cur_idx))
-    # }
+    print(vis_clus(spe_test,clustervar = 'spatialLIBD'))
+    print(vis_clus(spe_test,clustervar = 'smooth'))
+   if (j == 1){
+      in_spe <- spe_test
+    } else if (j == 2){
+      cross_spe <- spe_test
+    }
   }
   
   #####################################
-}
+} 
 print(results)
 
 backup <- phi(spe_train)
@@ -239,24 +262,25 @@ for (z in 1:ncol(theta(cross_spe))){
 
 ```{r}
 phi(spe_train) <- backup
-library(biomaRt)
-ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
-ensembl_ids <- rownames(spe_train)
+# library(biomaRt)
+# ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+# ensembl_ids <- rownames(spe_train)
+# 
+# # Get gene symbols for the given Ensembl IDs
+# results <- getBM(
+#   attributes = c("ensembl_gene_id", "hgnc_symbol"),  # Define the information to retrieve
+#   filters = "ensembl_gene_id",  # Define the filter (search by Ensembl ID)
+#   values = ensembl_ids,  # Values to filter by (your list of Ensembl IDs)
+#   mart = ensembl  # The connection object
+# )
 
-# Get gene symbols for the given Ensembl IDs
-results <- getBM(
-  attributes = c("ensembl_gene_id", "hgnc_symbol"),  # Define the information to retrieve
-  filters = "ensembl_gene_id",  # Define the filter (search by Ensembl ID)
-  values = ensembl_ids,  # Values to filter by (your list of Ensembl IDs)
-  mart = ensembl  # The connection object
-)
-
-temp <- phi(spe_train)
-temp <- temp[results$ensembl_gene_id,]
-table(results$ensembl_gene_id == rownames(temp))
-rownames(temp) <- results$hgnc_symbol
-phi(spe_train) <- temp
-
+# temp <- phi(spe_train)
+# 
+# temp <- temp[results$ensembl_gene_id,]
+# table(keep.genes == rownames(temp))
+# rownames(temp) <- results$hgnc_symbol
+# phi(spe_train) <- temp
+rownames(phi(spe_train)) <- rowData(spe_train)$gene_name
 
 
 viz_phi <- phi(spe_train)
@@ -271,7 +295,7 @@ viz_phi <- phi(spe_train)[unique(top10_k),]
 
 
 
-sig_genes <- readRDS("../../scGTM/misc/DLPFC_markers.rds")
+sig_genes <- readRDS("../data/DLPFC_markers.rds")
 #temp <- sig_genes[order(sig_genes$gene),c('test','gene','stat')]
 
 gene_labels <- c()

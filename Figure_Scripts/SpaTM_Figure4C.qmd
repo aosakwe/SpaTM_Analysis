@@ -80,26 +80,26 @@ D <- ncol(spe_train)
 
 
 ####Run RTM######
-rtm_weights <- train_RTM(counts(spe_train),
-          spe_train$int_cell,
-          rowData(spe_train)$gene_ints,
-          nbr_list,
-          alphaPrior(spe_train),
-          betaPrior(spe_train),
-          K,
-          ncol(spe_train),
-          ndk(spe_train),
-          nwk(spe_train),
-          6,
-          max_iter,
-          verbal = TRUE,
-          zero_gamma = FALSE,
-          rand_gamma = TRUE,#FALSE,
-          thresh = 0.00001,
-          lr =lr,
-          rho = 50000,
-          loss_fun = 1,
-          m_update = TRUE)
+rtm_weights <- SpaTM:::train_RTM(counts(spe_train),
+                                spe_train$int_cell,
+                                rowData(spe_train)$gene_ints,
+                                nbr_list,
+                                alphaPrior(spe_train),
+                                betaPrior(spe_train),
+                                K,
+                                ncol(spe_train),
+                                ndk(spe_train),
+                                nwk(spe_train),
+                                6,
+                                max_iter,
+                                verbal = TRUE,
+                                zero_gamma = FALSE,
+                                rand_gamma = TRUE,#FALSE,
+                                thresh = 0.00001,
+                                lr =lr,
+                                rho = 50000,
+                                loss_fun = 1,
+                                m_update = TRUE)
 
 spe_train <- buildTheta(spe_train)
 spe_train <- buildPhi(spe_train)
@@ -120,7 +120,7 @@ spe_test <- SpatialTopicExperiment(
   K,
   hvg = NULL)
 
-spe_test <- scGTMPredict(spe_test,1,100,FALSE,phi(spe_train))
+spe_test <- inferTopics(spe_test,1,100,FALSE,phi(spe_train))
 spe_test <- buildTheta(spe_test)
 
 

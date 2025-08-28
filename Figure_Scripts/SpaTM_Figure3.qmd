@@ -69,7 +69,7 @@ spe_test <- SpatialTopicExperiment(spe_test,
                                    labels = NULL,
                                    K = ncol(stm_phi))
 
-spe_test <- scGTMPredict(spe_test,
+spe_test <- inferTopics(spe_test,
                          num_threads = 4,
                          maxiter = 150,
                          verbal = T,
